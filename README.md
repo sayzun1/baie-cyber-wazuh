@@ -143,15 +143,24 @@ Procédure détaillée : [`docs/PREPARATION-TEMPLATE.md`](docs/PREPARATION-TEMPL
 
 ### 4. Clés SSH de l'équipe
 
-Chaque administrateur génère sa paire :
+Les trois clés de l'équipe sont **déjà intégrées** au projet :
+
+| Fichier | Compte Linux | Type | Empreinte SHA256 |
+|---------|--------------|------|------------------|
+| `yan.pub` | `yan` | RSA 2048 | `p6LiwCFtVOhl9DeOXUn8sSKbTvZysPjFh17MJy7FJaI` |
+| `hippo.pub` | `hippo` | RSA 2048 | `7T6y/tOZTFj8eclJJ665o09ML3B/nZd3xULoHDUcS3g` |
+| `eliaz.pub` | `eliaz` | RSA 2048 | `cGijZyMyhGo4aZilEGi/Q8CgueHfmzt2eQMzCncTmVs` |
+
+Pour ajouter un administrateur : il génère sa paire,
 
 ```bash
 ssh-keygen -t ed25519 -a 100 -C "prenom@baie-cyber" -f ~/.ssh/id_ed25519_baie
 ```
 
-Les fichiers `.pub` vont dans `roles/ssh_hardening/files/keys/`, et la liste
-`admins` de `inventory/group_vars/all.yml` fait la correspondance
-compte ↔ fichier.
+son fichier `.pub` va dans `roles/ssh_hardening/files/keys/`, et une entrée
+est ajoutée à la liste `admins` de `inventory/group_vars/all.yml`, qui fait
+la correspondance compte ↔ fichier. Détails dans
+[`roles/ssh_hardening/files/keys/README.md`](roles/ssh_hardening/files/keys/README.md).
 
 ### 5. Secrets
 

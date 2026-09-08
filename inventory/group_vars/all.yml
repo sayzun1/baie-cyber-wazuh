@@ -75,15 +75,15 @@ admins:
     shell: "/bin/bash"
     sudo: true
 
-  - name: "collegue1"
-    comment: "Collegue 1 - Administrateur"
-    key_file: "collegue1.pub"
+  - name: "hippo"
+    comment: "Hippo - Administrateur"
+    key_file: "hippo.pub"
     shell: "/bin/bash"
     sudo: true
 
-  - name: "collegue2"
-    comment: "Collegue 2 - Administrateur"
-    key_file: "collegue2.pub"
+  - name: "eliaz"
+    comment: "Eliaz - Administrateur"
+    key_file: "eliaz.pub"
     shell: "/bin/bash"
     sudo: true
 
