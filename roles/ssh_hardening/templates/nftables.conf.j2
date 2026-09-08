@@ -1,0 +1,59 @@
+#!/usr/sbin/nft -f
+# =====================================================================
+# Pare-feu nftables — généré par Ansible pour {{ inventory_hostname }}
+# Politique : tout ce qui n'est pas explicitement autorisé est refusé.
+# =====================================================================
+
+flush ruleset
+
+table inet filter {
+
+    # -- Réseaux autorisés à joindre le service SSH ------------------
+    set admin_networks {
+        type ipv4_addr
+        flags interval
+        elements = { {{ ssh_allowed_networks | join(', ') }} }
+    }
+
+    chain input {
+        type filter hook input priority filter; policy drop;
+
+        # Connexions déjà établies
+        ct state established,related accept
+        ct state invalid drop
+
+        # Boucle locale
+        iif lo accept
+
+        # ICMP : on garde le ping, c'est indispensable au diagnostic
+        ip protocol icmp icmp type { echo-request, echo-reply, destination-unreachable, time-exceeded } accept
+        ip6 nexthdr icmpv6 accept
+
+        # --- SSH : uniquement depuis les réseaux d'administration ---
+        # C'est la règle qui ferme réellement la porte. Le durcissement
+        # de sshd protège la porte ; cette règle décide qui peut même
+        # frapper dessus.
+        ip saddr @admin_networks tcp dport {{ ssh_port }} ct state new \
+            limit rate 10/minute burst 5 packets \
+            log prefix "NFT-SSH-ACCEPT " accept
+
+        # Toute autre tentative SSH est journalisée puis jetée
+        tcp dport {{ ssh_port }} log prefix "NFT-SSH-DROP " drop
+
+{% if 'lan' in group_names or 'dmz' in group_names %}
+        # Services web de la machine (adapter selon le rôle de la VM)
+        tcp dport { 80, 443 } accept
+{% endif %}
+
+        # Le reste est refusé silencieusement
+        counter drop
+    }
+
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+    }
+
+    chain output {
+        type filter hook output priority filter; policy accept;
+    }
+}

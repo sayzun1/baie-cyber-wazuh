@@ -1,0 +1,90 @@
+---
+# =============================================================================
+# RÔLE common — Socle système appliqué à toutes les VM
+# =============================================================================
+
+- name: "Common | Attente que cloud-init ait terminé"
+  ansible.builtin.command: cloud-init status --wait
+  register: _ci
+  changed_when: false
+  failed_when: false
+  when: provision_method | default('cloudinit') == 'cloudinit'
+
+- name: "Common | Définition du nom d'hôte"
+  ansible.builtin.hostname:
+    name: "{{ inventory_hostname }}"
+
+- name: "Common | Mise à jour du fichier /etc/hosts"
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    regexp: '^127\.0\.1\.1'
+    line: "127.0.1.1 {{ inventory_hostname }}.{{ projet_domaine }} {{ inventory_hostname }}"
+    state: present
+
+- name: "Common | Fuseau horaire {{ timezone }}"
+  community.general.timezone:
+    name: "{{ timezone }}"
+
+- name: "Common | Mise à jour de l'index des paquets"
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: "Common | Installation du socle logiciel"
+  ansible.builtin.apt:
+    name: "{{ base_packages }}"
+    state: present
+
+- name: "Common | Mise à jour de sécurité des paquets installés"
+  ansible.builtin.apt:
+    upgrade: safe
+  register: _upgrade
+  when: apply_updates | default(true) | bool
+
+- name: "Common | Configuration de la synchronisation horaire"
+  ansible.builtin.template:
+    src: chrony.conf.j2
+    dest: /etc/chrony/chrony.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart chrony
+
+- name: "Common | Activation de l'agent QEMU (intégration Proxmox)"
+  ansible.builtin.systemd:
+    name: qemu-guest-agent
+    enabled: true
+    state: started
+  failed_when: false
+
+- name: "Common | Mises à jour de sécurité automatiques"
+  when: unattended_upgrades | default(true) | bool
+  block:
+
+    - name: "Common | Installation d'unattended-upgrades"
+      ansible.builtin.apt:
+        name:
+          - unattended-upgrades
+          - apt-listchanges
+        state: present
+
+    - name: "Common | Activation des mises à jour automatiques de sécurité"
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/20auto-upgrades
+        content: |
+          APT::Periodic::Update-Package-Lists "1";
+          APT::Periodic::Unattended-Upgrade "1";
+          APT::Periodic::AutocleanInterval "7";
+        owner: root
+        group: root
+        mode: "0644"
+
+- name: "Common | Un redémarrage est-il nécessaire ?"
+  ansible.builtin.stat:
+    path: /var/run/reboot-required
+  register: _reboot_required
+
+- name: "Common | Redémarrage nécessaire"
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }} demande un redémarrage (noyau mis à jour)."
+  when: _reboot_required.stat.exists

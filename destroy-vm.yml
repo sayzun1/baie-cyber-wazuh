@@ -1,0 +1,80 @@
+---
+# =============================================================================
+# PLAYBOOK — Suppression d'une VM
+# -----------------------------------------------------------------------------
+#   ansible-playbook destroy-vm.yml -e "vm_name=srv-test01"
+#
+# Une double confirmation est demandée : la suppression est irréversible.
+# Pour un usage automatisé (script de remise à zéro de la maquette) :
+#   ansible-playbook destroy-vm.yml -e "vm_name=srv-test01 confirmation=OUI"
+# =============================================================================
+
+- name: "Suppression d'une VM de la baie"
+  hosts: proxmox
+  gather_facts: false
+  connection: local
+
+  vars_prompt:
+    - name: confirmation_saisie
+      prompt: "Confirmez la suppression DEFINITIVE de la VM en tapant OUI"
+      private: false
+      default: "NON"
+
+  tasks:
+
+    - name: "Le nom de la VM est fourni"
+      ansible.builtin.assert:
+        that:
+          - vm_name is defined
+        fail_msg: "Précisez la VM : -e \"vm_name=srv-test01\""
+
+    - name: "Contrôle de la confirmation"
+      ansible.builtin.assert:
+        that:
+          - (confirmation | default(confirmation_saisie)) == "OUI"
+        fail_msg: "Suppression annulée."
+
+    - name: "Recherche de la VM {{ vm_name }}"
+      community.general.proxmox_vm_info:
+        api_host: "{{ pve_api_host }}"
+        api_user: "{{ pve_api_user }}"
+        api_token_id: "{{ pve_api_token_id }}"
+        api_token_secret: "{{ pve_api_token_secret }}"
+        validate_certs: "{{ pve_validate_certs }}"
+        node: "{{ pve_node }}"
+        name: "{{ vm_name }}"
+      register: _cible
+
+    - name: "La VM existe bien"
+      ansible.builtin.assert:
+        that:
+          - _cible.proxmox_vms | length > 0
+        fail_msg: "Aucune VM nommée {{ vm_name }} sur {{ pve_node }}."
+
+    - name: "Arrêt de la VM"
+      community.general.proxmox_kvm:
+        api_host: "{{ pve_api_host }}"
+        api_user: "{{ pve_api_user }}"
+        api_token_id: "{{ pve_api_token_id }}"
+        api_token_secret: "{{ pve_api_token_secret }}"
+        validate_certs: "{{ pve_validate_certs }}"
+        node: "{{ pve_node }}"
+        vmid: "{{ _cible.proxmox_vms[0].vmid }}"
+        state: stopped
+        force: true
+        timeout: 90
+
+    - name: "Suppression définitive de la VM et de ses disques"
+      community.general.proxmox_kvm:
+        api_host: "{{ pve_api_host }}"
+        api_user: "{{ pve_api_user }}"
+        api_token_id: "{{ pve_api_token_id }}"
+        api_token_secret: "{{ pve_api_token_secret }}"
+        validate_certs: "{{ pve_validate_certs }}"
+        node: "{{ pve_node }}"
+        vmid: "{{ _cible.proxmox_vms[0].vmid }}"
+        state: absent
+
+    - name: "Suppression effectuée"
+      ansible.builtin.debug:
+        msg: "VM {{ vm_name }} (VMID {{ _cible.proxmox_vms[0].vmid }}) supprimée."

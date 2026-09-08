@@ -1,0 +1,11 @@
+---
+- name: reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+  listen: reload systemd
+
+- name: restart wazuh stack
+  ansible.builtin.systemd:
+    name: wazuh-stack
+    state: restarted
+  listen: restart wazuh stack

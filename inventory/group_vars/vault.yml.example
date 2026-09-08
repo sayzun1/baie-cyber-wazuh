@@ -1,0 +1,52 @@
+---
+# =============================================================================
+# MODÈLE DE FICHIER VAULT
+# -----------------------------------------------------------------------------
+# 1. Copier ce fichier :
+#      cp inventory/group_vars/vault.yml.example inventory/group_vars/vault.yml
+# 2. Remplir les vraies valeurs
+# 3. Chiffrer :
+#      ansible-vault encrypt inventory/group_vars/vault.yml
+# 4. Ne JAMAIS committer vault.yml en clair (voir .gitignore)
+#
+# Édition ultérieure :  ansible-vault edit inventory/group_vars/vault.yml
+# Visualisation      :  ansible-vault view inventory/group_vars/vault.yml
+# =============================================================================
+
+# Secret du token d'API Proxmox
+# Création côté Proxmox :
+#   pveum user add ansible@pve
+#   pveum aclmod / -user ansible@pve -role PVEVMAdmin
+#   pveum user token add ansible@pve automation --privsep 0
+vault_pve_api_token_secret: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+
+# Mot de passe root des VM (secours console uniquement — le SSH est en clé)
+# Générer le hash :  mkpasswd -m sha-512
+vault_vm_root_password_hash: "$6$rounds=656000$REMPLACEZ$MOI"
+
+# Mot de passe du compte de service initial (cloud-init / preseed)
+vault_vm_sysadm_password_hash: "$6$rounds=656000$REMPLACEZ$MOI"
+
+# =============================================================================
+# WAZUH (playbook deploy-wazuh.yml)
+# -----------------------------------------------------------------------------
+# Wazuh est livré avec des mots de passe par défaut publiquement connus.
+# Sur la machine qui centralise les journaux de toute l'infrastructure,
+# les laisser serait une faute lourde — le playbook refuse d'ailleurs de se
+# lancer si ces trois variables sont absentes.
+#
+# Contraintes de l'indexer : 8 caractères minimum, au moins une majuscule,
+# une minuscule, un chiffre et un caractère spécial.
+#
+# Générer un mot de passe solide :
+#   tr -dc 'A-Za-z0-9!@#%^*_+=' </dev/urandom | head -c 24; echo
+# =============================================================================
+
+# Compte « admin » de l'indexer — c'est aussi celui du dashboard web
+vault_wazuh_admin_password: "REMPLACEZ-MOI-Adm1n!"
+
+# Compte technique par lequel le dashboard interroge l'indexer
+vault_wazuh_kibanaserver_password: "REMPLACEZ-MOI-K1ba!"
+
+# Compte « wazuh-wui » de l'API du serveur Wazuh
+vault_wazuh_api_password: "REMPLACEZ-MOI-Ap1!"

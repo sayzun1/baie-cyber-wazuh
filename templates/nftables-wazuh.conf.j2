@@ -1,0 +1,107 @@
+#!/usr/sbin/nft -f
+# =====================================================================
+# Pare-feu du SIEM Wazuh — généré par Ansible pour {{ inventory_hostname }}
+# ---------------------------------------------------------------------
+# Un SIEM a deux publics très différents, et c'est tout l'intérêt de ce
+# fichier :
+#
+#   - Les AGENTS, répartis dans toutes les zones, doivent pouvoir déposer
+#     leurs journaux. Ports 1514/1515 ouverts largement.
+#   - Les ADMINISTRATEURS, eux, n'accèdent au dashboard, à l'API et au SSH
+#     que depuis le VLAN d'administration.
+#
+# Autrement dit : la machine collecte depuis partout, mais ne se pilote
+# que depuis un endroit. Une machine compromise en DMZ peut envoyer des
+# journaux ; elle ne peut ni ouvrir le dashboard, ni interroger l'API,
+# ni tenter un SSH.
+# =====================================================================
+
+flush ruleset
+
+table inet filter {
+
+    # -- Réseaux depuis lesquels on administre la machine ----------------
+    set admin_networks {
+        type ipv4_addr
+        flags interval
+        elements = { {{ ssh_allowed_networks | join(', ') }} }
+    }
+
+    # -- Réseaux hébergeant des agents Wazuh -----------------------------
+    set agent_networks {
+        type ipv4_addr
+        flags interval
+        elements = { {{ wazuh_agent_networks | join(', ') }} }
+    }
+
+    chain input {
+        type filter hook input priority filter; policy drop;
+
+        ct state established,related accept
+        ct state invalid drop
+        iif lo accept
+
+        # ICMP : indispensable au diagnostic réseau
+        ip protocol icmp icmp type { echo-request, echo-reply, destination-unreachable, time-exceeded } accept
+        ip6 nexthdr icmpv6 accept
+
+        # ------------------------------------------------------------------
+        # ADMINISTRATION — réservée au VLAN d'admin
+        # ------------------------------------------------------------------
+
+        # SSH
+        ip saddr @admin_networks tcp dport {{ ssh_port }} ct state new \
+            limit rate 10/minute burst 5 packets \
+            log prefix "NFT-SSH-ACCEPT " accept
+        tcp dport {{ ssh_port }} log prefix "NFT-SSH-DROP " drop
+
+        # Dashboard web Wazuh (HTTPS)
+        ip saddr @admin_networks tcp dport {{ wazuh_dashboard_port | default(443) }} accept
+        tcp dport {{ wazuh_dashboard_port | default(443) }} log prefix "NFT-DASH-DROP " drop
+
+        # API du serveur Wazuh
+        ip saddr @admin_networks tcp dport {{ wazuh_api_port | default(55000) }} accept
+        tcp dport {{ wazuh_api_port | default(55000) }} log prefix "NFT-API-DROP " drop
+
+        # ------------------------------------------------------------------
+        # COLLECTE — ouverte aux réseaux hébergeant des agents
+        # ------------------------------------------------------------------
+
+        # Communication des agents (envoi des événements)
+        ip saddr @agent_networks tcp dport {{ wazuh_agent_port | default(1514) }} accept
+        ip saddr @agent_networks udp dport {{ wazuh_agent_port | default(1514) }} accept
+
+        # Enrôlement des nouveaux agents
+        # Limité en débit : l'enrôlement est une opération rare et coûteuse,
+        # une rafale sur ce port est le signe d'un abus.
+        ip saddr @agent_networks tcp dport {{ wazuh_enrollment_port | default(1515) }} \
+            ct state new limit rate 20/minute accept
+
+        # Collecte syslog des équipements sans agent (switchs, pare-feux)
+        ip saddr @agent_networks udp dport {{ wazuh_syslog_port | default(514) }} accept
+
+        # ------------------------------------------------------------------
+        # L'indexer n'est JAMAIS exposé
+        # ------------------------------------------------------------------
+        # Le port 9200 donne un accès complet aux données indexées. Il ne
+        # doit être joignable que depuis les conteneurs, via le réseau
+        # interne de Docker — jamais depuis le réseau physique.
+        tcp dport {{ wazuh_indexer_port | default(9200) }} log prefix "NFT-INDEXER-DROP " drop
+
+        # Le reste est refusé
+        counter drop
+    }
+
+    # -----------------------------------------------------------------------
+    # Docker gère ses propres règles de forward via sa table « ip nat » et
+    # la chaîne DOCKER-USER. On laisse donc le forward permissif ici, sinon
+    # les conteneurs perdent l'accès au réseau et la stack ne démarre pas.
+    # -----------------------------------------------------------------------
+    chain forward {
+        type filter hook forward priority filter; policy accept;
+    }
+
+    chain output {
+        type filter hook output priority filter; policy accept;
+    }
+}

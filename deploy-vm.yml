@@ -1,0 +1,192 @@
+---
+# =============================================================================
+# PLAYBOOK PRINCIPAL — Création d'une VM Linux dans la baie cyber
+# =============================================================================
+#
+# UTILISATION MINIMALE (tout le reste prend les valeurs par défaut) :
+#
+#   ansible-playbook deploy-vm.yml -e "vm_name=srv-web02 vm_ip=192.168.10.21/24"
+#
+# UTILISATION COMPLÈTE :
+#
+#   ansible-playbook deploy-vm.yml \
+#     -e "vm_name=srv-ids01" \
+#     -e "vm_ip=192.168.20.50/24" \
+#     -e "vm_gateway=192.168.20.254" \
+#     -e "vm_bridge=vmbr2" \
+#     -e "vm_vlan=20" \
+#     -e "vm_cores=4" \
+#     -e "vm_memory=8192" \
+#     -e "vm_disk=80" \
+#     -e "vm_id=250"
+#
+# MODE PRESEED (installation complète depuis l'ISO au lieu du clone) :
+#
+#   ansible-playbook deploy-vm.yml -e "vm_name=srv-test01 vm_ip=192.168.10.99/24 provision_method=preseed"
+#
+# MODE SIMULATION (aucune modification, vérifie juste les paramètres) :
+#
+#   ansible-playbook deploy-vm.yml -e "vm_name=test vm_ip=192.168.1.99/24" --check
+#
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# PHASE 1 — Création de la VM sur l'hyperviseur
+# -----------------------------------------------------------------------------
+- name: "PHASE 1 | Provisionnement de la VM sur Proxmox"
+  hosts: proxmox
+  gather_facts: true
+  connection: local
+
+  vars:
+    # Méthode de création : "cloudinit" (rapide, défaut) ou "preseed" (install complète)
+    provision_method: "cloudinit"
+
+  pre_tasks:
+
+    - name: "Contrôle | Les paramètres obligatoires sont fournis"
+      ansible.builtin.assert:
+        that:
+          - vm_name is defined
+          - vm_name | length > 0
+          - vm_ip is defined
+        fail_msg: |
+
+          ============================================================
+          PARAMÈTRES MANQUANTS
+          ============================================================
+          Ce playbook a besoin au minimum de :
+            vm_name  : nom de la machine       (ex: srv-web02)
+            vm_ip    : adresse IP en CIDR      (ex: 192.168.10.21/24)
+
+          Exemple :
+            ansible-playbook deploy-vm.yml \
+              -e "vm_name=srv-web02 vm_ip=192.168.10.21/24"
+          ============================================================
+        success_msg: "Paramètres obligatoires présents."
+      tags: [always]
+
+    - name: "Contrôle | Le nom de machine respecte la norme DNS (RFC 1123)"
+      ansible.builtin.assert:
+        that:
+          - vm_name is match('^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$')
+        fail_msg: >-
+          Nom invalide : "{{ vm_name }}".
+          Attendu : minuscules, chiffres et tirets, 63 caractères max,
+          ne commence ni ne finit par un tiret. Exemple : srv-web02
+      tags: [always]
+
+    - name: "Contrôle | L'adresse IP est bien au format CIDR"
+      ansible.builtin.assert:
+        that:
+          - vm_ip is match('^((25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])/([0-9]|[1-2][0-9]|3[0-2])$')
+        fail_msg: >-
+          IP invalide : "{{ vm_ip }}".
+          Le masque est obligatoire. Exemple : 192.168.10.21/24
+      tags: [always]
+
+    - name: "Contrôle | Le bridge demandé existe sur l'hyperviseur"
+      ansible.builtin.assert:
+        that:
+          - vm_bridge is match('^vmbr[0-9]+$')
+        fail_msg: >-
+          Bridge invalide : "{{ vm_bridge }}". Format attendu : vmbrN (vmbr0, vmbr1...)
+      tags: [always]
+
+    - name: "Contrôle | La méthode de provisionnement est reconnue"
+      ansible.builtin.assert:
+        that:
+          - provision_method in ['cloudinit', 'preseed']
+        fail_msg: "provision_method doit valoir 'cloudinit' ou 'preseed' (reçu : {{ provision_method }})"
+      tags: [always]
+
+    - name: "Récapitulatif de ce qui va être créé"
+      ansible.builtin.debug:
+        msg:
+          - "================================================="
+          - "  DÉPLOIEMENT : {{ vm_name }}"
+          - "================================================="
+          - "  Méthode      : {{ provision_method }}"
+          - "  Hyperviseur  : {{ pve_api_host }} (noeud {{ pve_node }})"
+          - "  Adresse IP   : {{ vm_ip }}"
+          - "  Passerelle   : {{ vm_gateway }}"
+          - "  Bridge       : {{ vm_bridge }}{{ ' (VLAN ' ~ vm_vlan ~ ')' if vm_vlan | string | length > 0 else '' }}"
+          - "  vCPU         : {{ vm_cores }}"
+          - "  RAM          : {{ vm_memory }} Mo"
+          - "  Disque       : {{ vm_disk }} Go"
+          - "  Stockage     : {{ pve_storage }}"
+          - "================================================="
+      tags: [always]
+
+  roles:
+    - role: vm_provision
+      when: provision_method == 'cloudinit'
+      tags: [provision, cloudinit]
+
+    - role: vm_preseed
+      when: provision_method == 'preseed'
+      tags: [provision, preseed]
+
+  post_tasks:
+
+    - name: "Ajout de la nouvelle VM à l'inventaire en mémoire"
+      ansible.builtin.add_host:
+        name: "{{ vm_name }}"
+        groups:
+          - vms
+          - nouvellement_creees
+        ansible_host: "{{ vm_ip | ansible.utils.ipaddr('address') }}"
+        ansible_user: "{{ ansible_user }}"
+        ansible_ssh_private_key_file: "{{ ansible_ssh_private_key_file }}"
+        vm_ip: "{{ vm_ip }}"
+        vm_gateway: "{{ vm_gateway }}"
+        vm_bridge: "{{ vm_bridge }}"
+      changed_when: false
+      tags: [always]
+
+    - name: "Attente que la VM réponde en SSH (max {{ vm_ssh_wait_timeout }} s)"
+      ansible.builtin.wait_for:
+        host: "{{ vm_ip | ansible.utils.ipaddr('address') }}"
+        port: 22
+        delay: 15
+        timeout: "{{ vm_ssh_wait_timeout }}"
+        state: started
+      tags: [always]
+
+    - name: "Petite pause pour laisser cloud-init / l'installeur finir"
+      ansible.builtin.pause:
+        seconds: 20
+      when: not ansible_check_mode
+      tags: [always]
+
+
+# -----------------------------------------------------------------------------
+# PHASE 2 — Configuration du système invité
+# -----------------------------------------------------------------------------
+- name: "PHASE 2 | Configuration système et SSH de la VM"
+  hosts: nouvellement_creees
+  gather_facts: true
+  become: true
+
+  roles:
+    - role: common
+      tags: [common, config]
+
+    - role: ssh_hardening
+      tags: [ssh, securite, config]
+
+  post_tasks:
+
+    - name: "Déploiement terminé"
+      ansible.builtin.debug:
+        msg:
+          - "================================================="
+          - "  VM {{ inventory_hostname }} OPÉRATIONNELLE"
+          - "================================================="
+          - "  Connexion :"
+          - "    ssh {{ admins[0].name }}@{{ ansible_host }}"
+          - ""
+          - "  Comptes créés : {{ admins | map(attribute='name') | join(', ') }}"
+          - "  Root SSH      : désactivé"
+          - "  Mot de passe  : désactivé (clés uniquement)"
+          - "================================================="

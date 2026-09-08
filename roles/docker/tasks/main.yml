@@ -1,0 +1,291 @@
+---
+# =============================================================================
+# RÔLE docker — Installation complète de Docker CE sur Debian
+# -----------------------------------------------------------------------------
+# Source : dépôt officiel Docker (https://docs.docker.com/engine/install/debian/)
+# Testé sur Debian 12 (bookworm) et Debian 13 (trixie).
+# =============================================================================
+
+- name: "Docker | Vérification que l'on est bien sur Debian"
+  ansible.builtin.assert:
+    that:
+      - ansible_distribution == "Debian"
+      - ansible_distribution_major_version | int >= 12
+    fail_msg: >-
+      Ce rôle vise Debian 12 ou 13.
+      Détecté : {{ ansible_distribution }} {{ ansible_distribution_version }}
+
+- name: "Docker | Suppression des paquets Docker de la distribution"
+  # docker.io, docker-compose et podman-docker entrent en conflit avec les
+  # paquets officiels. On les retire avant d'installer.
+  ansible.builtin.apt:
+    name:
+      - docker.io
+      - docker-doc
+      - docker-compose
+      - docker-compose-v2
+      - podman-docker
+      - containerd
+      - runc
+    state: absent
+    purge: false
+
+# -----------------------------------------------------------------------------
+# Dépôt officiel Docker
+# -----------------------------------------------------------------------------
+- name: "Docker | Installation des prérequis"
+  ansible.builtin.apt:
+    name:
+      - ca-certificates
+      - curl
+      - gnupg
+      - apt-transport-https
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: "Docker | Création du répertoire des clés APT"
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: "Docker | Téléchargement de la clé GPG du dépôt Docker"
+  ansible.builtin.get_url:
+    url: "{{ docker_apt_key_url }}"
+    dest: "{{ docker_apt_keyring }}"
+    owner: root
+    group: root
+    mode: "0644"
+    force: false
+
+- name: "Docker | Déclaration du dépôt Docker (format deb822)"
+  # Debian 13 privilégie le format .sources plutôt que la ligne unique
+  # historique. Il est plus lisible et gère proprement la signature.
+  ansible.builtin.copy:
+    dest: /etc/apt/sources.list.d/docker.sources
+    content: |
+      # Dépôt officiel Docker — géré par Ansible
+      Types: deb
+      URIs: {{ docker_apt_url }}
+      Suites: {{ ansible_distribution_release }}
+      Components: stable
+      Architectures: {{ ansible_architecture | replace('x86_64', 'amd64') | replace('aarch64', 'arm64') }}
+      Signed-By: {{ docker_apt_keyring }}
+    owner: root
+    group: root
+    mode: "0644"
+  register: _docker_repo
+
+- name: "Docker | Suppression d'une ancienne déclaration au format .list"
+  ansible.builtin.file:
+    path: /etc/apt/sources.list.d/docker.list
+    state: absent
+
+- name: "Docker | Mise à jour de l'index APT"
+  ansible.builtin.apt:
+    update_cache: true
+  when: _docker_repo.changed
+
+# -----------------------------------------------------------------------------
+# Installation
+# -----------------------------------------------------------------------------
+- name: "Docker | Installation de Docker CE et du plugin compose"
+  ansible.builtin.apt:
+    name: "{{ docker_packages }}"
+    state: present
+  notify: restart docker
+
+# -----------------------------------------------------------------------------
+# Configuration du démon
+# -----------------------------------------------------------------------------
+- name: "Docker | Configuration du démon (daemon.json)"
+  ansible.builtin.template:
+    src: daemon.json.j2
+    dest: /etc/docker/daemon.json
+    owner: root
+    group: root
+    mode: "0644"
+    # Le démon refuse de démarrer sur un JSON invalide : on valide avant.
+    validate: "python3 -c \"import json,sys; json.load(open('%s'))\""
+  notify: restart docker
+
+- name: "Docker | Activation et démarrage du service"
+  ansible.builtin.systemd:
+    name: docker
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: "Docker | Activation de containerd"
+  ansible.builtin.systemd:
+    name: containerd
+    enabled: true
+    state: started
+
+# -----------------------------------------------------------------------------
+# Accès des administrateurs
+# -----------------------------------------------------------------------------
+- name: "Docker | Ajout des administrateurs au groupe docker"
+  # Appartenir au groupe docker équivaut à un accès root sur la machine
+  # (on peut monter / dans un conteneur privilégié). C'est acceptable ici
+  # puisque ces comptes ont déjà sudo, mais c'est à savoir et à dire en
+  # soutenance si on te pose la question.
+  ansible.builtin.user:
+    name: "{{ item }}"
+    groups: docker
+    append: true
+  loop: "{{ docker_users }}"
+  loop_control:
+    label: "{{ item }}"
+
+# -----------------------------------------------------------------------------
+# Réglages noyau requis par Wazuh / OpenSearch
+# -----------------------------------------------------------------------------
+- name: "Docker | Réglages noyau pour l'indexer Wazuh"
+  when: docker_sysctl_tuning | bool
+  block:
+
+    - name: "Docker | Application de vm.max_map_count et du réseau"
+      ansible.posix.sysctl:
+        name: "{{ item.name }}"
+        value: "{{ item.value }}"
+        sysctl_file: /etc/sysctl.d/99-wazuh-docker.conf
+        state: present
+        reload: true
+      loop:
+        # Sans celui-ci, l'indexer Wazuh refuse de démarrer.
+        - { name: "vm.max_map_count", value: "{{ docker_vm_max_map_count }}" }
+        # Nécessaire au routage entre conteneurs.
+        - { name: "net.ipv4.ip_forward", value: "1" }
+        # File d'attente des connexions entrantes, sinon des pertes sous charge.
+        - { name: "net.core.somaxconn", value: "4096" }
+        # Le noyau ne peut pas swapper la mémoire de l'indexer.
+        - { name: "vm.swappiness", value: "1" }
+      loop_control:
+        label: "{{ item.name }} = {{ item.value }}"
+
+    - name: "Docker | Relèvement de la limite de fichiers ouverts"
+      ansible.builtin.copy:
+        dest: /etc/security/limits.d/99-docker.conf
+        content: |
+          # Géré par Ansible — requis par l'indexer Wazuh
+          *  soft  nofile  {{ docker_nofile_limit }}
+          *  hard  nofile  {{ docker_nofile_limit }}
+          *  soft  memlock unlimited
+          *  hard  memlock unlimited
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: "Docker | Création du répertoire de surcharge systemd"
+      ansible.builtin.file:
+        path: /etc/systemd/system/docker.service.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: "Docker | Limites appliquées au service Docker lui-même"
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/docker.service.d/override.conf
+        content: |
+          # Géré par Ansible
+          [Service]
+          LimitNOFILE={{ docker_nofile_limit }}
+          LimitNPROC=infinity
+          LimitCORE=infinity
+        owner: root
+        group: root
+        mode: "0644"
+      notify:
+        - reload systemd
+        - restart docker
+
+# -----------------------------------------------------------------------------
+# Nettoyage automatique
+# -----------------------------------------------------------------------------
+- name: "Docker | Nettoyage automatique des images orphelines"
+  when: docker_prune_enabled | bool
+  block:
+
+    - name: "Docker | Service de nettoyage"
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/docker-prune.service
+        content: |
+          # Géré par Ansible
+          [Unit]
+          Description=Nettoyage des images et volumes Docker inutilises
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/bin/docker system prune -af --filter "until=168h"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: "Docker | Minuterie de nettoyage ({{ docker_prune_schedule }})"
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/docker-prune.timer
+        content: |
+          # Géré par Ansible
+          [Unit]
+          Description=Declenche le nettoyage Docker
+
+          [Timer]
+          OnCalendar={{ docker_prune_schedule }}
+          Persistent=true
+          RandomizedDelaySec=1h
+
+          [Install]
+          WantedBy=timers.target
+        owner: root
+        group: root
+        mode: "0644"
+      notify: reload systemd
+
+    - name: "Docker | Activation de la minuterie"
+      ansible.builtin.systemd:
+        name: docker-prune.timer
+        enabled: true
+        state: started
+        daemon_reload: true
+
+# -----------------------------------------------------------------------------
+# Vérifications
+# -----------------------------------------------------------------------------
+- name: "Docker | Application des changements en attente"
+  ansible.builtin.meta: flush_handlers
+
+- name: "Docker | Version installée"
+  ansible.builtin.command: docker --version
+  register: _docker_version
+  changed_when: false
+
+- name: "Docker | Version de compose"
+  ansible.builtin.command: docker compose version
+  register: _compose_version
+  changed_when: false
+
+- name: "Docker | Test de fonctionnement réel (hello-world)"
+  ansible.builtin.command: docker run --rm hello-world
+  register: _docker_test
+  changed_when: false
+  failed_when: "'Hello from Docker' not in _docker_test.stdout"
+  when: docker_run_test | default(true) | bool
+
+- name: "Docker | Contrôle de vm.max_map_count"
+  ansible.builtin.command: sysctl -n vm.max_map_count
+  register: _max_map
+  changed_when: false
+  failed_when: (_max_map.stdout | int) < docker_vm_max_map_count | int
+
+- name: "Docker | Récapitulatif"
+  ansible.builtin.debug:
+    msg:
+      - "{{ _docker_version.stdout }}"
+      - "{{ _compose_version.stdout }}"
+      - "vm.max_map_count = {{ _max_map.stdout }} (requis : {{ docker_vm_max_map_count }})"
+      - "Accès docker : {{ docker_users | join(', ') }}"

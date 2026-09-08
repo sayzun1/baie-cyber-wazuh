@@ -1,0 +1,207 @@
+---
+# =============================================================================
+# RÔLE vm_provision — Création d'une VM par clonage d'un template cloud-init
+# -----------------------------------------------------------------------------
+# Principe :
+#   1. On vérifie que le template existe
+#   2. On détermine un VMID libre si aucun n'est imposé
+#   3. On clone le template
+#   4. On applique la configuration matérielle (CPU/RAM/disque/réseau)
+#   5. On injecte hostname, IP, passerelle, DNS et clés SSH via cloud-init
+#   6. On démarre et on attend l'agent QEMU
+#
+# Durée typique : 30 à 60 secondes.
+# =============================================================================
+
+- name: "Provision | Récupération de la liste des VM existantes"
+  community.general.proxmox_vm_info:
+    api_host: "{{ pve_api_host }}"
+    api_user: "{{ pve_api_user }}"
+    api_token_id: "{{ pve_api_token_id }}"
+    api_token_secret: "{{ pve_api_token_secret }}"
+    validate_certs: "{{ pve_validate_certs }}"
+    node: "{{ pve_node }}"
+  register: pve_vms
+  check_mode: false
+
+- name: "Provision | Le template source est bien présent"
+  ansible.builtin.assert:
+    that:
+      - pve_vms.proxmox_vms | selectattr('name', 'defined')
+        | selectattr('name', 'equalto', vm_template_name) | list | length > 0
+    fail_msg: >-
+      Le template "{{ vm_template_name }}" est introuvable sur le noeud {{ pve_node }}.
+      Créez-le d'abord (voir docs/PREPARATION-TEMPLATE.md) ou lancez le playbook
+      avec provision_method=preseed.
+
+- name: "Provision | Refus de créer une VM dont le nom existe déjà"
+  ansible.builtin.assert:
+    that:
+      - pve_vms.proxmox_vms | selectattr('name', 'defined')
+        | selectattr('name', 'equalto', vm_name) | list | length == 0
+    fail_msg: >-
+      Une VM nommée "{{ vm_name }}" existe déjà sur {{ pve_node }}.
+      Choisissez un autre nom ou supprimez-la avec destroy-vm.yml.
+
+# -----------------------------------------------------------------------------
+# Attribution du VMID
+# -----------------------------------------------------------------------------
+- name: "Provision | Détermination d'un VMID libre"
+  when: vm_id | string | length == 0
+  block:
+
+    - name: "Provision | Liste des VMID déjà utilisés"
+      ansible.builtin.set_fact:
+        _vmids_utilises: "{{ pve_vms.proxmox_vms | map(attribute='vmid') | map('int') | list }}"
+
+    - name: "Provision | Sélection du premier VMID disponible"
+      ansible.builtin.set_fact:
+        vm_id: "{{ (range(vm_id_min | int, vm_id_max | int + 1) | list
+                    | difference(_vmids_utilises)) | first }}"
+
+    - name: "Provision | VMID retenu"
+      ansible.builtin.debug:
+        msg: "VMID attribué automatiquement : {{ vm_id }}"
+
+- name: "Provision | Le VMID demandé n'est pas déjà pris"
+  ansible.builtin.assert:
+    that:
+      - (vm_id | int) not in (pve_vms.proxmox_vms | map(attribute='vmid') | map('int') | list)
+    fail_msg: "Le VMID {{ vm_id }} est déjà utilisé sur {{ pve_node }}."
+
+# -----------------------------------------------------------------------------
+# Préparation des clés SSH à injecter par cloud-init
+# -----------------------------------------------------------------------------
+- name: "Provision | Lecture des clés publiques de l'équipe"
+  ansible.builtin.set_fact:
+    _cloudinit_keys: >-
+      {{ _cloudinit_keys | default([]) + [ lookup('file', cloudinit_ssh_keys_dir ~ '/' ~ item.key_file) ] }}
+  loop: "{{ admins }}"
+  loop_control:
+    label: "{{ item.name }} ({{ item.key_file }})"
+
+- name: "Provision | Au moins une clé publique a été trouvée"
+  ansible.builtin.assert:
+    that:
+      - _cloudinit_keys | length > 0
+    fail_msg: >-
+      Aucune clé publique lisible dans {{ cloudinit_ssh_keys_dir }}.
+      Déposez-y les fichiers .pub de l'équipe avant de déployer.
+
+# -----------------------------------------------------------------------------
+# Clonage
+# -----------------------------------------------------------------------------
+- name: "Provision | Clonage du template « {{ vm_template_name }} » vers « {{ vm_name }} »"
+  community.general.proxmox_kvm:
+    api_host: "{{ pve_api_host }}"
+    api_user: "{{ pve_api_user }}"
+    api_token_id: "{{ pve_api_token_id }}"
+    api_token_secret: "{{ pve_api_token_secret }}"
+    validate_certs: "{{ pve_validate_certs }}"
+    node: "{{ pve_node }}"
+    clone: "{{ vm_template_name }}"
+    name: "{{ vm_name }}"
+    newid: "{{ vm_id | int }}"
+    full: "{{ vm_full_clone }}"
+    storage: "{{ pve_storage }}"
+    format: "{{ 'raw' if pve_storage.endswith('lvm') else 'qcow2' }}"
+    timeout: "{{ vm_clone_timeout }}"
+    state: present
+  register: _clone
+  when: not ansible_check_mode
+
+- name: "Provision | Petite attente que le clone soit enregistré"
+  ansible.builtin.pause:
+    seconds: 5
+  when: not ansible_check_mode
+
+# -----------------------------------------------------------------------------
+# Configuration matérielle et cloud-init
+# -----------------------------------------------------------------------------
+- name: "Provision | Configuration matérielle, réseau et cloud-init"
+  community.general.proxmox_kvm:
+    api_host: "{{ pve_api_host }}"
+    api_user: "{{ pve_api_user }}"
+    api_token_id: "{{ pve_api_token_id }}"
+    api_token_secret: "{{ pve_api_token_secret }}"
+    validate_certs: "{{ pve_validate_certs }}"
+    node: "{{ pve_node }}"
+    vmid: "{{ vm_id | int }}"
+    name: "{{ vm_name }}"
+
+    # --- CPU / RAM ---
+    cores: "{{ vm_cores | int }}"
+    sockets: "{{ vm_sockets | int }}"
+    cpu: "host"
+    memory: "{{ vm_memory | int }}"
+    balloon: "{{ (vm_memory | int / 2) | round | int }}"
+
+    # --- Carte réseau : c'est ici que se joue le choix du bridge ---
+    # net0 = première interface. Le VLAN n'est ajouté que s'il est demandé.
+    net:
+      net0: "virtio,bridge={{ vm_bridge }}{{ ',tag=' ~ vm_vlan if vm_vlan | string | length > 0 else '' }}"
+
+    # --- Système ---
+    ostype: "{{ vm_os_type }}"
+    scsihw: "{{ vm_scsihw }}"
+    agent: "{{ 'enabled=1' if vm_agent else 'enabled=0' }}"
+    onboot: "{{ vm_onboot }}"
+    protection: "{{ vm_protection }}"
+    description: "{{ vm_description }} | {{ ansible_date_time.date | default('') }}"
+    tags: "{{ vm_tags }}"
+
+    # --- cloud-init : hostname, utilisateur, clés SSH ---
+    ciuser: "{{ ansible_user }}"
+    cipassword: "{{ vault_vm_sysadm_password_hash | default(omit) }}"
+    sshkeys: "{{ _cloudinit_keys | join('\n') }}"
+    searchdomains: "{{ vm_searchdomain }}"
+    nameservers: "{{ vm_nameservers }}"
+
+    # --- cloud-init : configuration IP statique ---
+    # ip=<CIDR>,gw=<passerelle>  -> exactement ce que l'utilisateur a passé en -e
+    ipconfig:
+      ipconfig0: "ip={{ vm_ip }},gw={{ vm_gateway }}"
+
+    update: true
+    state: present
+  when: not ansible_check_mode
+
+- name: "Provision | Redimensionnement du disque à {{ vm_disk }} Go"
+  community.general.proxmox_disk:
+    api_host: "{{ pve_api_host }}"
+    api_user: "{{ pve_api_user }}"
+    api_token_id: "{{ pve_api_token_id }}"
+    api_token_secret: "{{ pve_api_token_secret }}"
+    validate_certs: "{{ pve_validate_certs }}"
+    vmid: "{{ vm_id | int }}"
+    disk: "scsi0"
+    size: "{{ vm_disk }}G"
+    state: resized
+  register: _resize
+  failed_when:
+    - _resize is failed
+    - "'not supported' not in (_resize.msg | default(''))"
+    - "'shrink' not in (_resize.msg | default('') | lower)"
+  when: not ansible_check_mode
+
+# -----------------------------------------------------------------------------
+# Démarrage
+# -----------------------------------------------------------------------------
+- name: "Provision | Démarrage de la VM"
+  community.general.proxmox_kvm:
+    api_host: "{{ pve_api_host }}"
+    api_user: "{{ pve_api_user }}"
+    api_token_id: "{{ pve_api_token_id }}"
+    api_token_secret: "{{ pve_api_token_secret }}"
+    validate_certs: "{{ pve_validate_certs }}"
+    node: "{{ pve_node }}"
+    vmid: "{{ vm_id | int }}"
+    state: started
+    timeout: 120
+  when:
+    - vm_start_after_create | bool
+    - not ansible_check_mode
+
+- name: "Provision | VM créée"
+  ansible.builtin.debug:
+    msg: "VM {{ vm_name }} (VMID {{ vm_id }}) créée sur {{ vm_bridge }} avec l'IP {{ vm_ip }}."

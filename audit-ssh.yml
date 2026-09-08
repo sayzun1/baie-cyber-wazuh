@@ -1,0 +1,95 @@
+---
+# =============================================================================
+# PLAYBOOK — Audit de la configuration SSH du parc
+# -----------------------------------------------------------------------------
+# Ne modifie rien. Produit un rapport de conformité par machine.
+# Très utile à montrer en soutenance : c'est la preuve que le
+# durcissement est réellement appliqué, pas seulement écrit.
+#
+#   ansible-playbook audit-ssh.yml
+# =============================================================================
+
+- name: "Audit SSH du parc"
+  hosts: vms
+  gather_facts: true
+  become: true
+
+  tasks:
+
+    - name: "Audit | Lecture de la configuration effective du démon"
+      ansible.builtin.command: sshd -T
+      register: _sshd
+      changed_when: false
+
+    - name: "Audit | Contrôles de conformité"
+      ansible.builtin.set_fact:
+        _resultats:
+          - nom: "Authentification par mot de passe désactivée"
+            ok: "{{ 'passwordauthentication no' in _sshd.stdout }}"
+          - nom: "Connexion root interdite"
+            ok: "{{ 'permitrootlogin no' in _sshd.stdout }}"
+          - nom: "Authentification par clé active"
+            ok: "{{ 'pubkeyauthentication yes' in _sshd.stdout }}"
+          - nom: "Mots de passe vides interdits"
+            ok: "{{ 'permitemptypasswords no' in _sshd.stdout }}"
+          - nom: "Journalisation VERBOSE"
+            ok: "{{ 'loglevel VERBOSE' in _sshd.stdout }}"
+          - nom: "Groupe d'accès restreint"
+            ok: "{{ 'allowgroups ' ~ admin_group in _sshd.stdout }}"
+          - nom: "Transfert X11 désactivé"
+            ok: "{{ 'x11forwarding no' in _sshd.stdout }}"
+          - nom: "Transfert TCP désactivé"
+            ok: "{{ 'allowtcpforwarding no' in _sshd.stdout }}"
+
+    - name: "Audit | Vérification de fail2ban"
+      ansible.builtin.command: systemctl is-active fail2ban
+      register: _f2b
+      changed_when: false
+      failed_when: false
+
+    - name: "Audit | Comptes présents et clés déployées"
+      ansible.builtin.shell:
+        cmd: |
+          for u in {{ admins | map(attribute='name') | join(' ') }}; do
+            if id "$u" >/dev/null 2>&1; then
+              n=$(grep -c '^ssh-' "/home/$u/.ssh/authorized_keys" 2>/dev/null || echo 0)
+              echo "$u: OK, $n cle(s)"
+            else
+              echo "$u: COMPTE ABSENT"
+            fi
+          done
+      register: _comptes
+      changed_when: false
+
+    - name: "Audit | Empreinte de la clé d'hôte"
+      ansible.builtin.command: ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
+      register: _empreinte
+      changed_when: false
+
+    - name: "Audit | Rapport pour {{ inventory_hostname }}"
+      ansible.builtin.debug:
+        msg: "{{ _entete + _lignes_controles + _pied }}"
+      vars:
+        _entete:
+          - "==================================================="
+          - "  RAPPORT — {{ inventory_hostname }} ({{ ansible_host }})"
+          - "==================================================="
+        _lignes_controles: >-
+          {{ _resultats | map(attribute='nom') | zip(_resultats | map(attribute='ok')
+             | map('ternary', 'CONFORME', 'NON CONFORME')) | map('join', ' ..... ') | list }}
+        _pied: "{{ ['---------------------------------------------------',
+                    'fail2ban  : ' ~ _f2b.stdout,
+                    'Empreinte : ' ~ _empreinte.stdout,
+                    '---------------------------------------------------']
+                   + _comptes.stdout_lines
+                   + ['==================================================='] }}"
+
+    - name: "Audit | Échec si un contrôle n'est pas conforme"
+      ansible.builtin.assert:
+        that:
+          - _resultats | selectattr('ok', 'equalto', false) | list | length == 0
+        fail_msg: >-
+          Non conforme sur {{ inventory_hostname }} :
+          {{ _resultats | selectattr('ok', 'equalto', false) | map(attribute='nom') | join(' ; ') }}
+        success_msg: "{{ inventory_hostname }} : conforme sur les {{ _resultats | length }} points contrôlés."
+      when: audit_strict | default(false) | bool

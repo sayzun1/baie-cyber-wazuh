@@ -1,0 +1,275 @@
+---
+# =============================================================================
+# RÔLE ssh_hardening — Accès SSH complet pour les 3 administrateurs
+# -----------------------------------------------------------------------------
+# Ce que fait ce rôle :
+#   1. Crée un groupe d'administration et les 3 comptes
+#   2. Dépose les clés publiques dans authorized_keys (et retire les autres)
+#   3. Configure sudo
+#   4. Réécrit sshd_config avec une politique durcie
+#   5. Régénère les clés d'hôte (indispensable après un clone de template !)
+#   6. Installe et configure fail2ban
+#   7. Filtre l'accès SSH aux réseaux d'administration
+#   8. Vérifie la configuration AVANT de recharger le service
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 1. Comptes et groupes
+# -----------------------------------------------------------------------------
+- name: "SSH | Création du groupe d'administration « {{ admin_group }} »"
+  ansible.builtin.group:
+    name: "{{ admin_group }}"
+    state: present
+
+- name: "SSH | Création des comptes administrateurs"
+  ansible.builtin.user:
+    name: "{{ item.name }}"
+    comment: "{{ item.comment | default('Administrateur baie cyber') }}"
+    shell: "{{ item.shell | default('/bin/bash') }}"
+    groups: "{{ admin_group }}{{ ',sudo' if item.sudo | default(true) else '' }}"
+    append: true
+    create_home: true
+    password: "!"          # pas de mot de passe : connexion par clé uniquement
+    state: present
+  loop: "{{ admins }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: "SSH | Création des répertoires .ssh"
+  ansible.builtin.file:
+    path: "/home/{{ item.name }}/.ssh"
+    state: directory
+    owner: "{{ item.name }}"
+    group: "{{ item.name }}"
+    mode: "0700"
+  loop: "{{ admins }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+# -----------------------------------------------------------------------------
+# 2. Clés publiques
+#    exclusive: true -> toute clé qui n'est pas dans le projet est supprimée.
+#    C'est le point qui garantit que seuls vous trois avez l'accès.
+# -----------------------------------------------------------------------------
+- name: "SSH | Déploiement des clés publiques (mode exclusif)"
+  ansible.posix.authorized_key:
+    user: "{{ item.name }}"
+    key: "{{ lookup('file', 'keys/' ~ item.key_file) }}"
+    state: present
+    exclusive: true
+    manage_dir: true
+  loop: "{{ admins }}"
+  loop_control:
+    label: "{{ item.name }} <- {{ item.key_file }}"
+
+# Le compte de service utilisé par Ansible reçoit aussi les 3 clés :
+# si un compte nominatif casse, vous gardez une porte d'entrée.
+- name: "SSH | Clés de l'équipe sur le compte de service {{ ansible_user }}"
+  ansible.posix.authorized_key:
+    user: "{{ ansible_user }}"
+    key: "{{ lookup('file', 'keys/' ~ item.key_file) }}"
+    state: present
+  loop: "{{ admins }}"
+  loop_control:
+    label: "{{ ansible_user }} <- {{ item.key_file }}"
+
+- name: "SSH | Le compte de service est dans le groupe {{ admin_group }}"
+  ansible.builtin.user:
+    name: "{{ ansible_user }}"
+    groups: "{{ admin_group }}"
+    append: true
+
+# -----------------------------------------------------------------------------
+# 3. Sudo
+# -----------------------------------------------------------------------------
+- name: "SSH | Droits sudo pour le groupe {{ admin_group }}"
+  ansible.builtin.copy:
+    dest: "/etc/sudoers.d/10-{{ admin_group }}"
+    content: |
+      # Géré par Ansible — projet baie cyber
+      # Les administrateurs saisissent leur mot de passe... qu'ils n'ont pas.
+      # On passe donc en NOPASSWD, l'authentification étant assurée par la clé SSH.
+      %{{ admin_group }} ALL=(ALL:ALL) NOPASSWD:ALL
+      Defaults:%{{ admin_group }} !requiretty
+      Defaults        logfile="/var/log/sudo.log"
+      Defaults        log_input, log_output
+    owner: root
+    group: root
+    mode: "0440"
+    validate: "visudo -cf %s"
+
+# -----------------------------------------------------------------------------
+# 4. Clés d'hôte
+#    Un clone de template hérite des clés d'hôte du template : toutes les VM
+#    auraient la même empreinte, ce qui casse complètement l'intérêt du
+#    contrôle d'empreinte SSH. On les régénère donc à la première config.
+# -----------------------------------------------------------------------------
+- name: "SSH | Vérification du marqueur de régénération des clés d'hôte"
+  ansible.builtin.stat:
+    path: /etc/ssh/.ansible_hostkeys_regenerated
+  register: _hostkey_marker
+
+- name: "SSH | Régénération des clés d'hôte (unicité par machine)"
+  when: not _hostkey_marker.stat.exists
+  block:
+
+    - name: "SSH | Suppression des anciennes clés d'hôte héritées du template"
+      ansible.builtin.shell:
+        cmd: "rm -f /etc/ssh/ssh_host_*"
+      changed_when: true
+
+    - name: "SSH | Génération de nouvelles clés d'hôte"
+      ansible.builtin.shell:
+        cmd: "ssh-keygen -A"
+      changed_when: true
+
+    - name: "SSH | Pose du marqueur"
+      ansible.builtin.file:
+        path: /etc/ssh/.ansible_hostkeys_regenerated
+        state: touch
+        mode: "0644"
+
+    - name: "SSH | Récupération de la nouvelle empreinte ED25519"
+      ansible.builtin.shell:
+        cmd: "ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub"
+      register: _fingerprint
+      changed_when: false
+
+    - name: "SSH | Empreinte de l'hôte (à noter dans votre documentation)"
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} : {{ _fingerprint.stdout }}"
+
+  notify: restart sshd
+
+# -----------------------------------------------------------------------------
+# 5. Configuration du démon SSH
+# -----------------------------------------------------------------------------
+- name: "SSH | Sauvegarde du sshd_config d'origine"
+  ansible.builtin.copy:
+    src: /etc/ssh/sshd_config
+    dest: /etc/ssh/sshd_config.orig
+    remote_src: true
+    force: false
+    mode: "0600"
+
+- name: "SSH | Bannière légale d'avertissement"
+  ansible.builtin.template:
+    src: banner.j2
+    dest: /etc/ssh/banner
+    owner: root
+    group: root
+    mode: "0644"
+  when: ssh_banner_enabled | bool
+
+- name: "SSH | Déploiement du sshd_config durci"
+  ansible.builtin.template:
+    src: sshd_config.j2
+    dest: /etc/ssh/sshd_config
+    owner: root
+    group: root
+    mode: "0600"
+    # Le validate est le filet de sécurité : si le fichier généré est
+    # invalide, Ansible échoue AVANT d'écraser le fichier en place.
+    # Sans ça, une faute de frappe = VM injoignable.
+    validate: "/usr/sbin/sshd -t -f %s"
+    backup: true
+  notify: restart sshd
+
+- name: "SSH | Neutralisation des surcharges livrées par la distribution"
+  ansible.builtin.file:
+    path: "/etc/ssh/sshd_config.d/{{ item }}"
+    state: absent
+  loop:
+    - "50-cloud-init.conf"
+    - "50-redhat.conf"
+  failed_when: false
+
+# -----------------------------------------------------------------------------
+# 6. Fail2ban
+# -----------------------------------------------------------------------------
+- name: "SSH | Installation de fail2ban"
+  ansible.builtin.apt:
+    name:
+      - fail2ban
+      - python3-systemd
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  when: fail2ban_enabled | bool
+
+- name: "SSH | Configuration de la prison SSH"
+  ansible.builtin.template:
+    src: jail.local.j2
+    dest: /etc/fail2ban/jail.local
+    owner: root
+    group: root
+    mode: "0644"
+  when: fail2ban_enabled | bool
+  notify: restart fail2ban
+
+- name: "SSH | Activation de fail2ban au démarrage"
+  ansible.builtin.systemd:
+    name: fail2ban
+    enabled: true
+    state: started
+  when: fail2ban_enabled | bool
+
+# -----------------------------------------------------------------------------
+# 7. Filtrage réseau de l'accès SSH
+# -----------------------------------------------------------------------------
+- name: "SSH | Restriction de l'accès SSH aux réseaux d'administration"
+  when: firewall_enabled | bool
+  block:
+
+    - name: "SSH | Installation de nftables"
+      ansible.builtin.apt:
+        name: nftables
+        state: present
+
+    - name: "SSH | Déploiement des règles de filtrage"
+      ansible.builtin.template:
+        src: nftables.conf.j2
+        dest: /etc/nftables.conf
+        owner: root
+        group: root
+        mode: "0755"
+        validate: "nft -c -f %s"
+      notify: reload nftables
+
+    - name: "SSH | Activation de nftables au démarrage"
+      ansible.builtin.systemd:
+        name: nftables
+        enabled: true
+        state: started
+
+# -----------------------------------------------------------------------------
+# 8. Vérifications finales
+# -----------------------------------------------------------------------------
+- name: "SSH | Application immédiate des changements en attente"
+  ansible.builtin.meta: flush_handlers
+
+- name: "SSH | Le service sshd est actif"
+  ansible.builtin.systemd:
+    name: ssh
+    state: started
+    enabled: true
+
+- name: "SSH | Contrôle : le mot de passe est bien refusé"
+  ansible.builtin.shell:
+    cmd: "sshd -T | grep -Ei '^(passwordauthentication|permitrootlogin|pubkeyauthentication)'"
+  register: _sshd_effectif
+  changed_when: false
+
+- name: "SSH | Configuration effective du démon"
+  ansible.builtin.debug:
+    var: _sshd_effectif.stdout_lines
+
+- name: "SSH | Contrôle : chaque administrateur a bien sa clé"
+  ansible.builtin.shell:
+    cmd: "wc -l < /home/{{ item.name }}/.ssh/authorized_keys"
+  register: _cles
+  changed_when: false
+  failed_when: (_cles.stdout | int) < 1
+  loop: "{{ admins }}"
+  loop_control:
+    label: "{{ item.name }}"

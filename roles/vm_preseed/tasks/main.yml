@@ -1,0 +1,201 @@
+---
+# =============================================================================
+# RÔLE vm_preseed — Création d'une VM par installation Debian automatisée
+# -----------------------------------------------------------------------------
+# Différence avec vm_provision : aucun template n'est nécessaire, l'installeur
+# Debian tourne réellement et lit un preseed.cfg généré à la volée.
+# Plus lent (5 à 15 min) mais montre toute la chaîne d'installation — c'est
+# souvent ce qu'un jury attend de voir expliqué.
+#
+# Chaîne : preseed généré -> servi en HTTP -> passé en paramètre noyau à
+#          l'installeur via la ligne de commande de boot.
+# =============================================================================
+
+- name: "Preseed | Récupération des VM existantes"
+  community.general.proxmox_vm_info:
+    api_host: "{{ pve_api_host }}"
+    api_user: "{{ pve_api_user }}"
+    api_token_id: "{{ pve_api_token_id }}"
+    api_token_secret: "{{ pve_api_token_secret }}"
+    validate_certs: "{{ pve_validate_certs }}"
+    node: "{{ pve_node }}"
+  register: pve_vms
+  check_mode: false
+
+- name: "Preseed | Le nom n'est pas déjà pris"
+  ansible.builtin.assert:
+    that:
+      - pve_vms.proxmox_vms | selectattr('name', 'defined')
+        | selectattr('name', 'equalto', vm_name) | list | length == 0
+    fail_msg: "Une VM nommée {{ vm_name }} existe déjà."
+
+- name: "Preseed | Attribution d'un VMID libre"
+  ansible.builtin.set_fact:
+    vm_id: "{{ (range(vm_id_min | int, vm_id_max | int + 1) | list
+                | difference(pve_vms.proxmox_vms | map(attribute='vmid') | map('int') | list)) | first }}"
+  when: vm_id | string | length == 0
+
+# -----------------------------------------------------------------------------
+# Génération et publication du preseed
+# -----------------------------------------------------------------------------
+- name: "Preseed | Création du dossier de travail"
+  ansible.builtin.file:
+    path: "{{ preseed_workdir }}"
+    state: directory
+    mode: "0755"
+
+- name: "Preseed | Génération du fichier preseed.cfg pour {{ vm_name }}"
+  ansible.builtin.template:
+    src: preseed.cfg.j2
+    dest: "{{ preseed_workdir }}/{{ vm_name }}.cfg"
+    mode: "0644"
+  register: _preseed_file
+
+- name: "Preseed | Détection de l'IP de la machine Ansible vue par la VM"
+  ansible.builtin.set_fact:
+    _preseed_server_ip: "{{ preseed_server_ip | default(ansible_default_ipv4.address) }}"
+
+- name: "Preseed | Démarrage du serveur HTTP temporaire (port {{ preseed_http_port }})"
+  ansible.builtin.shell:
+    cmd: >-
+      nohup python3 -m http.server {{ preseed_http_port }}
+      --directory {{ preseed_workdir }} > {{ preseed_workdir }}/http.log 2>&1 &
+      echo $!
+  register: _http_pid
+  changed_when: true
+  when: not ansible_check_mode
+
+- name: "Preseed | Vérification que le preseed est bien servi"
+  ansible.builtin.uri:
+    url: "http://{{ _preseed_server_ip }}:{{ preseed_http_port }}/{{ vm_name }}.cfg"
+    return_content: false
+    status_code: 200
+  retries: 5
+  delay: 2
+  register: _preseed_check
+  until: _preseed_check is succeeded
+  when: not ansible_check_mode
+
+# -----------------------------------------------------------------------------
+# Création de la VM vierge et lancement de l'installation
+# -----------------------------------------------------------------------------
+- name: "Preseed | Création de la VM vierge {{ vm_name }} (VMID {{ vm_id }})"
+  community.general.proxmox_kvm:
+    api_host: "{{ pve_api_host }}"
+    api_user: "{{ pve_api_user }}"
+    api_token_id: "{{ pve_api_token_id }}"
+    api_token_secret: "{{ pve_api_token_secret }}"
+    validate_certs: "{{ pve_validate_certs }}"
+    node: "{{ pve_node }}"
+    vmid: "{{ vm_id | int }}"
+    name: "{{ vm_name }}"
+    cores: "{{ vm_cores | int }}"
+    sockets: "{{ vm_sockets | int }}"
+    cpu: "host"
+    memory: "{{ vm_memory | int }}"
+    ostype: "{{ vm_os_type }}"
+    scsihw: "{{ vm_scsihw }}"
+    agent: "enabled=1"
+    onboot: "{{ vm_onboot }}"
+    description: "{{ vm_name }} - install preseed automatisee (Ansible)"
+    tags: "ansible,baie-cyber,preseed"
+
+    # Disque système
+    scsi:
+      scsi0: "{{ pve_storage }}:{{ vm_disk }},format={{ 'raw' if pve_storage.endswith('lvm') else 'qcow2' }}"
+
+    # Lecteur CD avec l'ISO d'installation
+    ide:
+      ide2: "{{ preseed_iso_volume }},media=cdrom"
+
+    # Carte réseau sur le bridge choisi
+    net:
+      net0: "virtio,bridge={{ vm_bridge }}{{ ',tag=' ~ vm_vlan if vm_vlan | string | length > 0 else '' }}"
+
+    # Ordre de boot : CD d'abord pour l'installation
+    boot: "order=ide2;scsi0"
+    state: present
+  when: not ansible_check_mode
+
+# -----------------------------------------------------------------------------
+# Injection de la ligne de commande noyau qui pointe vers le preseed.
+# Proxmox permet de passer des args QEMU ; on utilise ici la méthode
+# "args" avec -kernel-cmdline non disponible partout : la voie fiable est
+# de passer par l'ISO ou par le menu de boot. On documente donc les deux.
+# -----------------------------------------------------------------------------
+- name: "Preseed | Rappel de la ligne de boot à utiliser"
+  ansible.builtin.debug:
+    msg:
+      - "==================================================================="
+      - " INSTALLATION AUTOMATISÉE — {{ vm_name }}"
+      - "==================================================================="
+      - " Le fichier preseed est disponible ici :"
+      - "   http://{{ _preseed_server_ip }}:{{ preseed_http_port }}/{{ vm_name }}.cfg"
+      - ""
+      - " Deux façons de le faire consommer par l'installeur :"
+      - ""
+      - " A) ISO remasterisée (100 % automatique)"
+      - "    Lancez d'abord :  ansible-playbook build-preseed-iso.yml"
+      - "    L'ISO générée intègre le preseed, aucune intervention n'est"
+      - "    nécessaire au boot."
+      - ""
+      - " B) Saisie au menu de boot (rapide à démontrer en soutenance)"
+      - "    Ouvrir la console noVNC de la VM, choisir 'Install' puis TAB,"
+      - "    et ajouter à la fin de la ligne :"
+      - "      auto=true priority=critical"
+      - "      url=http://{{ _preseed_server_ip }}:{{ preseed_http_port }}/{{ vm_name }}.cfg"
+      - "      hostname={{ vm_name }} domain={{ projet_domaine }}"
+      - "==================================================================="
+
+- name: "Preseed | Démarrage de la VM"
+  community.general.proxmox_kvm:
+    api_host: "{{ pve_api_host }}"
+    api_user: "{{ pve_api_user }}"
+    api_token_id: "{{ pve_api_token_id }}"
+    api_token_secret: "{{ pve_api_token_secret }}"
+    validate_certs: "{{ pve_validate_certs }}"
+    node: "{{ pve_node }}"
+    vmid: "{{ vm_id | int }}"
+    state: started
+  when: not ansible_check_mode
+
+- name: "Preseed | Attente de la fin d'installation (SSH répond) — jusqu'à {{ preseed_install_timeout }} s"
+  ansible.builtin.wait_for:
+    host: "{{ vm_ip | ansible.utils.ipaddr('address') }}"
+    port: 22
+    delay: 60
+    timeout: "{{ preseed_install_timeout }}"
+    state: started
+  when: not ansible_check_mode
+
+# -----------------------------------------------------------------------------
+# Nettoyage : on retire le CD et on remet le disque en premier boot
+# -----------------------------------------------------------------------------
+- name: "Preseed | Retrait de l'ISO et bascule du boot sur le disque"
+  community.general.proxmox_kvm:
+    api_host: "{{ pve_api_host }}"
+    api_user: "{{ pve_api_user }}"
+    api_token_id: "{{ pve_api_token_id }}"
+    api_token_secret: "{{ pve_api_token_secret }}"
+    validate_certs: "{{ pve_validate_certs }}"
+    node: "{{ pve_node }}"
+    vmid: "{{ vm_id | int }}"
+    ide:
+      ide2: "none,media=cdrom"
+    boot: "order=scsi0"
+    update: true
+    state: present
+  when: not ansible_check_mode
+
+- name: "Preseed | Arrêt du serveur HTTP temporaire"
+  ansible.builtin.shell:
+    cmd: "kill {{ _http_pid.stdout }} 2>/dev/null || true"
+  changed_when: false
+  when:
+    - not ansible_check_mode
+    - _http_pid.stdout is defined
+
+- name: "Preseed | Suppression du preseed généré (il contient des hash)"
+  ansible.builtin.file:
+    path: "{{ preseed_workdir }}/{{ vm_name }}.cfg"
+    state: absent

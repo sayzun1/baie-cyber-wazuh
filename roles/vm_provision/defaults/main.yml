@@ -1,0 +1,14 @@
+---
+# Valeurs par défaut du rôle vm_provision.
+# Elles sont écrasées par inventory/group_vars/all.yml puis par les -e en CLI.
+
+vm_id: ""                     # vide = attribution automatique du prochain ID libre
+vm_id_min: 100                # borne basse pour l'attribution auto
+vm_id_max: 999
+vm_full_clone: true           # true = clone indépendant, false = clone lié (rapide, mais dépend du template)
+vm_description: "Déployée par Ansible - projet baie cyber"
+vm_tags: "ansible,baie-cyber"
+
+# Clés publiques injectées par cloud-init dès le premier démarrage.
+# Elles permettent à Ansible de se connecter en PHASE 2.
+cloudinit_ssh_keys_dir: "{{ playbook_dir }}/roles/ssh_hardening/files/keys"

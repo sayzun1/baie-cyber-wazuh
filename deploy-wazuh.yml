@@ -1,0 +1,315 @@
+---
+# =============================================================================
+# PLAYBOOK — VM Debian 13 + Docker + Wazuh SIEM
+# =============================================================================
+#
+# Crée une VM Debian 13 (Trixie) sur Proxmox, la durcit, y installe Docker
+# et y déploie Wazuh en conteneurs (déploiement single-node).
+#
+# UTILISATION MINIMALE :
+#
+#   ansible-playbook deploy-wazuh.yml -e "vm_ip=10.0.0.30/24"
+#
+# UTILISATION COMPLÈTE :
+#
+#   ansible-playbook deploy-wazuh.yml \
+#     -e "vm_name=srv-wazuh01" \
+#     -e "vm_ip=10.0.0.30/24" \
+#     -e "vm_gateway=10.0.0.254" \
+#     -e "vm_bridge=vmbr3" \
+#     -e "vm_vlan=30" \
+#     -e "vm_cores=6 vm_memory=12288 vm_disk=200"
+#
+# SUR UNE VM DÉJÀ EXISTANTE (pas de création, seulement Docker + Wazuh) :
+#
+#   ansible-playbook deploy-wazuh.yml --limit srv-wazuh01 --tags docker,wazuh \
+#     -e "creer_vm=false"
+#
+# PRÉREQUIS :
+#   - Un template Debian 13 sur Proxmox (voir docs/PREPARATION-TEMPLATE.md,
+#     même procédure avec l'image trixie)
+#   - Les 3 mots de passe Wazuh dans inventory/group_vars/vault.yml :
+#       vault_wazuh_admin_password
+#       vault_wazuh_kibanaserver_password
+#       vault_wazuh_api_password
+#
+# DURÉE : 20 à 30 minutes (le téléchargement des images pèse ~2 Go).
+#
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# PHASE 1 — Création de la VM
+# -----------------------------------------------------------------------------
+- name: "PHASE 1 | Création de la VM Wazuh sur Proxmox"
+  hosts: proxmox
+  gather_facts: true
+  connection: local
+
+  vars:
+    creer_vm: true
+    provision_method: "cloudinit"
+
+    # --- Identité de la machine ---
+    vm_name: "srv-wazuh01"
+
+    # --- Template Debian 13 -------------------------------------------------
+    # À créer une fois sur Proxmox avec l'image cloud Trixie :
+    #   https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2
+    vm_template_name: "debian13-cloudinit"
+
+    # --- Ressources ---------------------------------------------------------
+    # Minimum officiel Wazuh single-node : 4 cœurs, 8 Go, 50 Go.
+    # On prend 100 Go de disque : les journaux d'un SIEM grossissent vite,
+    # et un indexer qui n'a plus de place passe ses index en lecture seule.
+    vm_cores: 4
+    vm_memory: 8192
+    vm_disk: 100
+
+    # --- Réseau : zone administration par défaut ---
+    vm_bridge: "vmbr3"
+    vm_gateway: "10.0.0.254"
+
+    vm_description: "SIEM Wazuh - Debian 13 + Docker - deployee par Ansible"
+    vm_tags: "ansible,baie-cyber,siem,wazuh,docker"
+
+  pre_tasks:
+
+    - name: "Contrôle | L'adresse IP est fournie"
+      ansible.builtin.assert:
+        that:
+          - vm_ip is defined
+        fail_msg: |
+
+          ============================================================
+          PARAMÈTRE MANQUANT
+          ============================================================
+          Il faut au minimum l'adresse IP de la machine Wazuh :
+
+            ansible-playbook deploy-wazuh.yml -e "vm_ip=10.0.0.30/24"
+          ============================================================
+      when: creer_vm | bool
+      tags: [always]
+
+    - name: "Contrôle | Les mots de passe Wazuh sont dans le vault"
+      # On vérifie AVANT de créer la VM : inutile de provisionner 100 Go
+      # pour échouer 20 minutes plus tard sur un mot de passe manquant.
+      ansible.builtin.assert:
+        that:
+          - vault_wazuh_admin_password is defined
+          - vault_wazuh_kibanaserver_password is defined
+          - vault_wazuh_api_password is defined
+          - vault_wazuh_admin_password | length >= 8
+          - vault_wazuh_kibanaserver_password | length >= 8
+          - vault_wazuh_api_password | length >= 8
+        fail_msg: |
+
+          ============================================================
+          MOTS DE PASSE WAZUH MANQUANTS
+          ============================================================
+          Wazuh est livré avec des mots de passe par défaut publics.
+          Sur la machine qui centralise les journaux de toute
+          l'infrastructure, les laisser serait une faute lourde.
+
+          Ajoute dans inventory/group_vars/vault.yml :
+
+            vault_wazuh_admin_password:        "..."
+            vault_wazuh_kibanaserver_password: "..."
+            vault_wazuh_api_password:          "..."
+
+          Contraintes : 8 caractères minimum, avec au moins une
+          majuscule, une minuscule, un chiffre et un caractère spécial.
+
+          Puis :  ansible-vault encrypt inventory/group_vars/vault.yml
+          ============================================================
+      tags: [always]
+
+    - name: "Contrôle | Les ressources sont suffisantes pour Wazuh"
+      ansible.builtin.assert:
+        that:
+          - vm_cores | int >= 4
+          - vm_memory | int >= 8192
+          - vm_disk | int >= 50
+        fail_msg: >-
+          Wazuh single-node demande au minimum 4 vCPU, 8192 Mo de RAM et
+          50 Go de disque. Demandé : {{ vm_cores }} vCPU,
+          {{ vm_memory }} Mo, {{ vm_disk }} Go.
+        success_msg: "Ressources conformes aux prérequis Wazuh."
+      when: creer_vm | bool
+      tags: [always]
+
+    - name: "Récapitulatif du déploiement"
+      ansible.builtin.debug:
+        msg:
+          - "==================================================="
+          - "  DÉPLOIEMENT SIEM WAZUH"
+          - "==================================================="
+          - "  Machine     : {{ vm_name }}"
+          - "  Système     : Debian 13 (Trixie)"
+          - "  Adresse IP  : {{ vm_ip | default('(VM existante)') }}"
+          - "  Bridge      : {{ vm_bridge }}"
+          - "  Ressources  : {{ vm_cores }} vCPU / {{ vm_memory }} Mo / {{ vm_disk }} Go"
+          - "  Wazuh       : {{ wazuh_version | default('4.14.7') }} (single-node)"
+          - "==================================================="
+          - "  Compte environ 20 à 30 minutes."
+          - "==================================================="
+      tags: [always]
+
+  roles:
+    - role: vm_provision
+      when: creer_vm | bool
+      tags: [provision]
+
+  post_tasks:
+
+    - name: "Ajout de la VM Wazuh à l'inventaire en mémoire"
+      ansible.builtin.add_host:
+        name: "{{ vm_name }}"
+        groups:
+          - vms
+          - admin
+          - wazuh
+        ansible_host: "{{ vm_ip | ansible.utils.ipaddr('address') }}"
+        ansible_user: "{{ ansible_user }}"
+        ansible_ssh_private_key_file: "{{ ansible_ssh_private_key_file }}"
+        vm_ip: "{{ vm_ip }}"
+        vm_bridge: "{{ vm_bridge }}"
+      changed_when: false
+      when: creer_vm | bool
+      tags: [always]
+
+    - name: "Attente que la VM réponde en SSH"
+      ansible.builtin.wait_for:
+        host: "{{ vm_ip | ansible.utils.ipaddr('address') }}"
+        port: 22
+        delay: 15
+        timeout: "{{ vm_ssh_wait_timeout }}"
+      when: creer_vm | bool
+      tags: [always]
+
+
+# -----------------------------------------------------------------------------
+# PHASE 2 — Système, SSH, Docker et Wazuh
+# -----------------------------------------------------------------------------
+- name: "PHASE 2 | Configuration du SIEM"
+  hosts: "{{ 'wazuh' if (creer_vm | default(true) | bool) else (cible | default('wazuh')) }}"
+  gather_facts: true
+  become: true
+
+  vars:
+    # -------------------------------------------------------------------------
+    # Pare-feu spécifique au SIEM.
+    #
+    # Un SIEM a une contrainte particulière : ses agents doivent pouvoir le
+    # joindre depuis TOUTES les zones (LAN, DMZ, poste utilisateur), sinon il
+    # ne collecte rien. On ouvre donc largement les ports d'agents — mais
+    # l'administration (SSH, dashboard, API) reste réservée aux réseaux
+    # d'administration.
+    #
+    # C'est une distinction à savoir expliquer en soutenance : « ouvert à
+    # tous » et « ouvert à l'administration » ne sont pas la même chose,
+    # et les deux coexistent sur la même machine.
+    # -------------------------------------------------------------------------
+    wazuh_agent_networks:
+      - "192.168.10.0/24"    # zone LAN
+      - "172.16.0.0/24"      # zone DMZ
+      - "10.0.0.0/24"        # zone administration
+
+  pre_tasks:
+
+    - name: "Contrôle | La machine tourne bien sous Debian 13"
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == "Debian"
+          - ansible_distribution_major_version | int >= 13
+        fail_msg: >-
+          Ce playbook vise Debian 13 (Trixie).
+          Détecté : {{ ansible_distribution }} {{ ansible_distribution_version }}.
+          Vérifie que vm_template_name pointe bien sur un template Debian 13.
+        success_msg: "{{ ansible_distribution }} {{ ansible_distribution_version }} — conforme."
+      tags: [always]
+
+  roles:
+
+    # --- Socle système ------------------------------------------------------
+    - role: common
+      tags: [common, config]
+
+    # --- Accès SSH : les mêmes 3 administrateurs que sur tout le parc -------
+    - role: ssh_hardening
+      vars:
+        # Le SIEM reçoit les journaux de toute l'infra : on lui ouvre les
+        # ports d'agents en plus des règles habituelles.
+        firewall_extra_rules: true
+      tags: [ssh, securite, config]
+
+    # --- Docker -------------------------------------------------------------
+    - role: docker
+      tags: [docker]
+
+    # --- Wazuh --------------------------------------------------------------
+    - role: wazuh_docker
+      tags: [wazuh, siem]
+
+  post_tasks:
+
+    # -------------------------------------------------------------------------
+    # Le rôle ssh_hardening pose un pare-feu qui n'autorise que le SSH.
+    # On ajoute ici les ports propres au SIEM, sans toucher au rôle générique.
+    # -------------------------------------------------------------------------
+    - name: "Pare-feu | Règles spécifiques au SIEM"
+      when: firewall_enabled | bool
+      tags: [firewall, securite]
+      block:
+
+        - name: "Pare-feu | Déploiement des règles Wazuh"
+          ansible.builtin.template:
+            src: nftables-wazuh.conf.j2
+            dest: /etc/nftables.conf
+            owner: root
+            group: root
+            mode: "0755"
+            validate: "nft -c -f %s"
+          register: _nft_wazuh
+
+        - name: "Pare-feu | Rechargement"
+          ansible.builtin.systemd:
+            name: nftables
+            state: reloaded
+          when: _nft_wazuh.changed
+
+        - name: "Pare-feu | Règles actives"
+          ansible.builtin.command: nft list ruleset
+          register: _nft_actif
+          changed_when: false
+
+    - name: "Déploiement terminé"
+      ansible.builtin.debug:
+        msg:
+          - "==================================================================="
+          - "  SIEM WAZUH OPÉRATIONNEL — {{ inventory_hostname }}"
+          - "==================================================================="
+          - ""
+          - "  INTERFACE WEB"
+          - "    https://{{ ansible_host }}"
+          - "    Identifiant  : admin"
+          - "    Mot de passe : vault_wazuh_admin_password"
+          - ""
+          - "    Le certificat est auto-signé : le navigateur affiche un"
+          - "    avertissement au premier accès. C'est normal, continue."
+          - ""
+          - "  ACCÈS ADMINISTRATEUR"
+          - "    ssh {{ admins[0].name }}@{{ ansible_host }}"
+          - "    Comptes : {{ admins | map(attribute='name') | join(', ') }}"
+          - ""
+          - "  ENRÔLER UN AGENT (sur la machine à surveiller)"
+          - "    curl -sO https://packages.wazuh.com/4.x/apt/pool/main/w/wazuh-agent/wazuh-agent_{{ wazuh_version | default('4.14.7') }}-1_amd64.deb"
+          - "    sudo WAZUH_MANAGER='{{ ansible_host }}' dpkg -i ./wazuh-agent_*.deb"
+          - "    sudo systemctl enable --now wazuh-agent"
+          - ""
+          - "  EXPLOITATION"
+          - "    systemctl status wazuh-stack     état de la stack"
+          - "    systemctl restart wazuh-stack    redémarrage complet"
+          - "    cd {{ wazuh_stack_dir | default('/opt/wazuh/wazuh-docker/single-node') }} && docker compose logs -f"
+          - ""
+          - "  Documentation du projet : docs/WAZUH.md"
+          - "==================================================================="

@@ -1,0 +1,35 @@
+{
+  "_commentaire": "Genere par Ansible pour {{ inventory_hostname }} - ne pas editer a la main",
+
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "{{ docker_log_max_size }}",
+    "max-file": "{{ docker_log_max_file }}"
+  },
+
+  "storage-driver": "{{ docker_storage_driver }}",
+  "live-restore": {{ docker_live_restore | lower }},
+  "userland-proxy": {{ docker_userland_proxy | lower }},
+{% if docker_no_new_privileges %}
+  "no-new-privileges": true,
+{% endif %}
+
+  "default-ulimits": {
+    "nofile": {
+      "Name": "nofile",
+      "Hard": {{ docker_nofile_limit }},
+      "Soft": {{ docker_nofile_limit }}
+    }
+  },
+
+  "default-address-pools": [
+    {
+      "base": "{{ docker_default_address_pool_base }}",
+      "size": {{ docker_default_address_pool_size }}
+    }
+  ],
+
+  "features": {
+    "buildkit": true
+  }
+}

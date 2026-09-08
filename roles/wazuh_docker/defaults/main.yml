@@ -1,0 +1,64 @@
+---
+# =============================================================================
+# Rôle wazuh_docker — Déploiement de Wazuh en conteneurs (single-node)
+# =============================================================================
+
+# --- Version ----------------------------------------------------------------
+# Épingler la version est important : un « latest » qui bouge tout seul, c'est
+# une maquette qui ne se reproduit pas à l'identique le jour de la soutenance.
+wazuh_version: "4.14.7"
+wazuh_repo_url: "https://github.com/wazuh/wazuh-docker.git"
+wazuh_deployment: "single-node"          # single-node ou multi-node
+
+# --- Emplacement ------------------------------------------------------------
+wazuh_base_dir: "/opt/wazuh"
+wazuh_repo_dir: "{{ wazuh_base_dir }}/wazuh-docker"
+wazuh_stack_dir: "{{ wazuh_repo_dir }}/{{ wazuh_deployment }}"
+
+# --- Ports exposés ----------------------------------------------------------
+wazuh_dashboard_port: 443     # interface web HTTPS
+wazuh_api_port: 55000         # API du serveur Wazuh
+wazuh_agent_port: 1514        # communication des agents (TCP)
+wazuh_enrollment_port: 1515   # enrôlement des agents
+wazuh_syslog_port: 514        # collecte syslog (UDP)
+wazuh_indexer_port: 9200      # indexer — NE PAS exposer hors de la machine
+
+# =============================================================================
+# MOTS DE PASSE
+# -----------------------------------------------------------------------------
+# Wazuh est livré avec des mots de passe par défaut publiquement connus
+# (admin/SecretPassword, wazuh-wui/MyS3cr37P450r.*-). Les laisser en place sur
+# un SIEM, c'est-à-dire sur la machine qui centralise les journaux de toute
+# l'infrastructure, serait une faute lourde.
+#
+# Ces variables pointent vers le vault. Ajoute-les dans
+# inventory/group_vars/vault.yml puis chiffre le fichier.
+#
+# Contraintes de l'indexer : 8 caractères minimum, au moins une majuscule,
+# une minuscule, un chiffre et un caractère spécial.
+# =============================================================================
+wazuh_admin_password: "{{ vault_wazuh_admin_password | default('') }}"
+wazuh_kibanaserver_password: "{{ vault_wazuh_kibanaserver_password | default('') }}"
+wazuh_api_password: "{{ vault_wazuh_api_password | default('') }}"
+
+# Refuse de déployer si les mots de passe n'ont pas été définis.
+# Mets false uniquement pour un test jetable, jamais sur une machine qui reste.
+wazuh_require_custom_passwords: true
+
+# --- Comportement -----------------------------------------------------------
+wazuh_start_stack: true              # démarrer la stack en fin de rôle
+wazuh_wait_for_dashboard: true
+wazuh_dashboard_timeout: 900         # 15 min : le 1er démarrage est long
+wazuh_pull_timeout: 1800             # téléchargement des images (~2 Go)
+
+# --- Réglages de l'indexer --------------------------------------------------
+# Règle OpenSearch : la moitié de la RAM disponible, sans dépasser 31 Go.
+# Sur une VM à 8 Go, 4 Go pour l'indexer est le bon compromis.
+wazuh_indexer_heap: "4g"
+wazuh_dashboard_memory: "1g"
+
+# --- Rétention et sauvegarde ------------------------------------------------
+wazuh_backup_enabled: true
+wazuh_backup_dir: "/opt/wazuh/backups"
+wazuh_backup_schedule: "daily"
+wazuh_backup_retention_days: 7

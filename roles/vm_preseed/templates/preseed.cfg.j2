@@ -1,0 +1,96 @@
+#_preseed_V1
+# =============================================================================
+# Fichier preseed généré par Ansible pour {{ vm_name }}
+# Installation Debian 12 entièrement non interactive
+# =============================================================================
+
+### Langue, clavier, pays
+d-i debian-installer/locale                 string {{ preseed_locale }}
+d-i debian-installer/language               string fr
+d-i debian-installer/country                string FR
+d-i localechooser/supported-locales         multiselect fr_FR.UTF-8, en_US.UTF-8
+d-i keyboard-configuration/xkb-keymap       select {{ preseed_keymap }}
+d-i console-setup/ask_detect                boolean false
+
+### Réseau — configuration STATIQUE demandée par l'utilisateur
+d-i netcfg/choose_interface                 select auto
+d-i netcfg/disable_autoconfig               boolean true
+d-i netcfg/dhcp_failed                      note
+d-i netcfg/dhcp_options                     select Configure network manually
+d-i netcfg/get_ipaddress                    string {{ vm_ip | ansible.utils.ipaddr('address') }}
+d-i netcfg/get_netmask                      string {{ vm_ip | ansible.utils.ipaddr('netmask') }}
+d-i netcfg/get_gateway                      string {{ vm_gateway }}
+d-i netcfg/get_nameservers                  string {{ vm_nameservers }}
+d-i netcfg/confirm_static                   boolean true
+d-i netcfg/get_hostname                     string {{ vm_name }}
+d-i netcfg/get_domain                       string {{ projet_domaine }}
+d-i netcfg/hostname                         string {{ vm_name }}
+d-i hw-detect/load_firmware                 boolean false
+
+### Miroir
+d-i mirror/country                          string manual
+d-i mirror/http/hostname                    string {{ preseed_mirror_host }}
+d-i mirror/http/directory                   string {{ preseed_mirror_dir }}
+d-i mirror/http/proxy                       string
+d-i mirror/suite                            string bookworm
+
+### Horloge
+d-i clock-setup/utc                         boolean true
+d-i time/zone                               string {{ preseed_timezone }}
+d-i clock-setup/ntp                         boolean true
+d-i clock-setup/ntp-server                  string {{ ntp_servers[0] }}
+
+### Comptes
+# Root : connexion SSH interdite ensuite, mot de passe de secours console.
+d-i passwd/root-login                       boolean true
+d-i passwd/root-password-crypted            password {{ vault_vm_root_password_hash }}
+
+# Compte de service utilisé par Ansible pour la phase 2.
+d-i passwd/user-fullname                    string Compte de service Ansible
+d-i passwd/username                         string {{ ansible_user }}
+d-i passwd/user-password-crypted            password {{ vault_vm_sysadm_password_hash }}
+d-i passwd/user-default-groups              string sudo
+
+### Partitionnement — LVM sur tout le disque
+d-i partman-auto/method                     string lvm
+d-i partman-auto/choose_recipe              select {{ preseed_partitioning }}
+d-i partman-lvm/device_remove_lvm           boolean true
+d-i partman-md/device_remove_md             boolean true
+d-i partman-lvm/confirm                     boolean true
+d-i partman-lvm/confirm_nooverwrite         boolean true
+d-i partman-auto-lvm/guided_size            string max
+d-i partman/confirm_write_new_label         boolean true
+d-i partman/choose_partition                select finish
+d-i partman/confirm                         boolean true
+d-i partman/confirm_nooverwrite             boolean true
+d-i partman-basicfilesystems/no_swap        boolean false
+
+### Paquets
+tasksel tasksel/first                       multiselect standard, ssh-server
+d-i pkgsel/include                          string {{ base_packages | join(' ') }}
+d-i pkgsel/upgrade                          select full-upgrade
+popularity-contest popularity-contest/participate boolean false
+
+### GRUB
+d-i grub-installer/only_debian              boolean true
+d-i grub-installer/with_other_os            boolean true
+d-i grub-installer/bootdev                  string default
+
+### Post-installation : on injecte tout de suite les clés SSH de l'équipe
+# pour qu'Ansible puisse enchaîner sur la phase 2 sans mot de passe.
+d-i preseed/late_command string \
+    in-target mkdir -p /home/{{ ansible_user }}/.ssh ; \
+{% for admin in admins %}
+    in-target sh -c 'echo "{{ lookup('file', playbook_dir ~ '/roles/ssh_hardening/files/keys/' ~ admin.key_file) }}" >> /home/{{ ansible_user }}/.ssh/authorized_keys' ; \
+{% endfor %}
+    in-target chown -R {{ ansible_user }}:{{ ansible_user }} /home/{{ ansible_user }}/.ssh ; \
+    in-target chmod 700 /home/{{ ansible_user }}/.ssh ; \
+    in-target chmod 600 /home/{{ ansible_user }}/.ssh/authorized_keys ; \
+    in-target sh -c 'echo "{{ ansible_user }} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/90-ansible' ; \
+    in-target chmod 440 /etc/sudoers.d/90-ansible ; \
+    in-target systemctl enable ssh ; \
+    in-target systemctl enable qemu-guest-agent
+
+### Fin : redémarrage automatique
+d-i finish-install/reboot_in_progress       note
+d-i debian-installer/exit/poweroff          boolean false

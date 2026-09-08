@@ -1,0 +1,162 @@
+---
+# =============================================================================
+# Variables globales du projet
+# =============================================================================
+
+# --- Identité du projet ------------------------------------------------------
+projet_nom: "Baie reseau cyber"
+projet_domaine: "cyber.lan"
+
+# --- Connexion aux VM (compte créé par cloud-init / preseed) ------------------
+ansible_user: "sysadm"
+ansible_ssh_private_key_file: "~/.ssh/id_ed25519_baie"
+ansible_python_interpreter: "/usr/bin/python3"
+
+# =============================================================================
+# ACCÈS PROXMOX
+# -----------------------------------------------------------------------------
+# Les identifiants réels sont chiffrés dans inventory/group_vars/vault.yml.
+# Ici on ne fait que pointer vers les variables du vault (bonne pratique :
+# on voit d'un coup d'oeil ce qui est secret sans déchiffrer le vault).
+# =============================================================================
+pve_api_host: "192.168.1.10"           # IP ou FQDN de l'hyperviseur
+pve_api_user: "ansible@pve"            # Utilisateur API dédié (PAS root@pam)
+pve_api_token_id: "automation"         # ID du token d'API
+pve_api_token_secret: "{{ vault_pve_api_token_secret }}"
+pve_validate_certs: false              # true si vous avez un certificat valide
+pve_node: "pve01"                      # Noeud par défaut
+pve_storage: "local-lvm"               # Stockage des disques VM
+pve_iso_storage: "local"               # Stockage des ISO / snippets
+
+# =============================================================================
+# VALEURS PAR DÉFAUT D'UNE VM
+# -----------------------------------------------------------------------------
+# Toute variable ci-dessous peut être écrasée :
+#   - dans l'inventaire (host_vars)
+#   - en ligne de commande avec -e "vm_cores=8"
+# =============================================================================
+vm_template_name: "debian12-cloudinit"  # Nom du template à cloner
+vm_cores: 2                             # vCPU
+vm_sockets: 1
+vm_memory: 2048                         # Mo
+vm_disk: 20                             # Go
+vm_bridge: "vmbr0"                      # Carte réseau / bridge par défaut
+vm_vlan: ""                             # Tag VLAN (vide = pas de tag)
+vm_gateway: "192.168.1.254"
+vm_nameservers: "192.168.1.254 9.9.9.9"
+vm_searchdomain: "{{ projet_domaine }}"
+vm_onboot: true                         # Démarrage auto avec l'hyperviseur
+vm_start_after_create: true
+vm_os_type: "l26"                       # Linux kernel 2.6+ / 3.x+
+vm_scsihw: "virtio-scsi-single"
+vm_agent: true                          # QEMU guest agent
+vm_protection: false                    # true = interdit la suppression
+
+# --- Timeouts ----------------------------------------------------------------
+vm_clone_timeout: 300
+vm_ssh_wait_timeout: 600
+
+# =============================================================================
+# ÉQUIPE PROJET — les 3 administrateurs
+# -----------------------------------------------------------------------------
+# Chaque membre aura :
+#   - un compte système sur toutes les VM
+#   - sa clé publique dans ~/.ssh/authorized_keys
+#   - les droits sudo (via le groupe défini plus bas)
+#
+# Déposez les clés publiques dans roles/ssh_hardening/files/keys/<nom>.pub
+# =============================================================================
+admin_group: "adminsys"
+
+admins:
+  - name: "yan"
+    comment: "Yan Meslin - Administrateur"
+    key_file: "yan.pub"
+    shell: "/bin/bash"
+    sudo: true
+
+  - name: "collegue1"
+    comment: "Collegue 1 - Administrateur"
+    key_file: "collegue1.pub"
+    shell: "/bin/bash"
+    sudo: true
+
+  - name: "collegue2"
+    comment: "Collegue 2 - Administrateur"
+    key_file: "collegue2.pub"
+    shell: "/bin/bash"
+    sudo: true
+
+# =============================================================================
+# POLITIQUE SSH
+# =============================================================================
+ssh_port: 22
+ssh_permit_root_login: "no"
+ssh_password_authentication: false
+ssh_pubkey_authentication: true
+ssh_max_auth_tries: 3
+ssh_login_grace_time: 30
+ssh_client_alive_interval: 300
+ssh_client_alive_count_max: 2
+ssh_x11_forwarding: false
+ssh_allow_groups: "{{ admin_group }}"
+ssh_banner_enabled: true
+
+# Réseaux autorisés à joindre le SSH (utilisé par le pare-feu nftables).
+# Restreindre au VLAN d'administration est un vrai point bonus en soutenance.
+ssh_allowed_networks:
+  - "192.168.1.0/24"
+  - "10.0.0.0/24"
+
+# --- Durcissement crypto (conforme aux recommandations ANSSI) -----------------
+ssh_kex_algorithms:
+  - "curve25519-sha256"
+  - "curve25519-sha256@libssh.org"
+  - "diffie-hellman-group-exchange-sha256"
+ssh_ciphers:
+  - "chacha20-poly1305@openssh.com"
+  - "aes256-gcm@openssh.com"
+  - "aes128-gcm@openssh.com"
+  - "aes256-ctr"
+ssh_macs:
+  - "hmac-sha2-512-etm@openssh.com"
+  - "hmac-sha2-256-etm@openssh.com"
+  - "umac-128-etm@openssh.com"
+ssh_host_key_algorithms:
+  - "ssh-ed25519"
+  - "rsa-sha2-512"
+
+# --- Fail2ban ----------------------------------------------------------------
+fail2ban_enabled: true
+fail2ban_maxretry: 4
+fail2ban_bantime: 3600
+fail2ban_findtime: 600
+
+# --- Pare-feu local ----------------------------------------------------------
+firewall_enabled: true
+
+# =============================================================================
+# CONFIGURATION SYSTÈME DE BASE (rôle common)
+# =============================================================================
+timezone: "Europe/Paris"
+locale: "fr_FR.UTF-8"
+ntp_servers:
+  - "0.fr.pool.ntp.org"
+  - "1.fr.pool.ntp.org"
+
+base_packages:
+  - vim
+  - curl
+  - wget
+  - git
+  - htop
+  - net-tools
+  - dnsutils
+  - tcpdump
+  - rsync
+  - unzip
+  - ca-certificates
+  - qemu-guest-agent
+  - python3
+  - sudo
+  - chrony

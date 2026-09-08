@@ -1,0 +1,21 @@
+---
+# Collections Ansible nécessaires au projet.
+# Installation :  ansible-galaxy collection install -r requirements.yml
+
+collections:
+
+  # Modules proxmox_kvm, proxmox_vm_info, proxmox_disk, timezone
+  - name: community.general
+    version: ">=8.0.0"
+
+  # Module authorized_key et gestion des permissions POSIX
+  - name: ansible.posix
+    version: ">=1.5.0"
+
+  # Filtres ipaddr utilisés pour découper les CIDR (adresse / masque)
+  - name: ansible.utils
+    version: ">=2.10.0"
+
+  # Dépendance de ansible.utils pour la manipulation d'adresses
+  - name: community.crypto
+    version: ">=2.15.0"

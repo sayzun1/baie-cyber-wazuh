@@ -1,0 +1,14 @@
+---
+timezone: "Europe/Paris"
+projet_domaine: "cyber.lan"
+ntp_servers:
+  - "0.fr.pool.ntp.org"
+  - "1.fr.pool.ntp.org"
+base_packages:
+  - vim
+  - curl
+  - sudo
+  - chrony
+  - qemu-guest-agent
+apply_updates: true
+unattended_upgrades: true

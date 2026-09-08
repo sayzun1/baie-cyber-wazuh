@@ -1,0 +1,413 @@
+---
+# =============================================================================
+# RÔLE wazuh_docker — Wazuh {{ wazuh_version }} en conteneurs (single-node)
+# -----------------------------------------------------------------------------
+# Déroulement :
+#   1. Contrôles préalables (RAM, disque, vm.max_map_count, mots de passe)
+#   2. Clone du dépôt wazuh-docker sur la version épinglée
+#   3. Remplacement des mots de passe par défaut (compose + internal_users.yml)
+#   4. Génération des certificats internes
+#   5. Téléchargement des images puis démarrage de la stack
+#   6. Attente du dashboard et contrôles de bon fonctionnement
+#
+# Durée : 10 à 20 minutes selon le débit (les images pèsent ~2 Go).
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 1. Contrôles préalables
+# -----------------------------------------------------------------------------
+- name: "Wazuh | Les mots de passe personnalisés sont définis"
+  ansible.builtin.assert:
+    that:
+      - wazuh_admin_password | length >= 8
+      - wazuh_kibanaserver_password | length >= 8
+      - wazuh_api_password | length >= 8
+    fail_msg: |
+
+      ============================================================
+      MOTS DE PASSE WAZUH NON DÉFINIS
+      ============================================================
+      Wazuh serait déployé avec ses mots de passe par défaut, qui
+      sont publics. Sur un SIEM, c'est inacceptable.
+
+      Ajoute ces trois lignes dans inventory/group_vars/vault.yml :
+
+        vault_wazuh_admin_password:         "..."
+        vault_wazuh_kibanaserver_password:  "..."
+        vault_wazuh_api_password:           "..."
+
+      Contraintes : 8 caractères minimum, au moins une majuscule,
+      une minuscule, un chiffre et un caractère spécial.
+
+      Puis chiffre le fichier :
+        ansible-vault encrypt inventory/group_vars/vault.yml
+      ============================================================
+    success_msg: "Mots de passe personnalisés présents."
+  when: wazuh_require_custom_passwords | bool
+
+- name: "Wazuh | Contrôle de la mémoire disponible"
+  ansible.builtin.assert:
+    that:
+      - ansible_memtotal_mb >= 7500
+    fail_msg: >-
+      Wazuh single-node demande au moins 8 Go de RAM.
+      Cette machine en a {{ ansible_memtotal_mb }} Mo.
+      Augmente la RAM de la VM avant de continuer.
+    success_msg: "RAM : {{ ansible_memtotal_mb }} Mo — suffisant."
+
+- name: "Wazuh | Contrôle de l'espace disque sur /"
+  ansible.builtin.assert:
+    that:
+      - (ansible_mounts | selectattr('mount', 'equalto', '/') | first).size_available > 40000000000
+    fail_msg: >-
+      Il faut au moins 40 Go libres (50 Go recommandés par Wazuh).
+      Disponible :
+      {{ ((ansible_mounts | selectattr('mount','equalto','/') | first).size_available / 1073741824) | round(1) }} Go.
+    success_msg: "Espace disque suffisant."
+
+- name: "Wazuh | Contrôle de vm.max_map_count"
+  ansible.builtin.command: sysctl -n vm.max_map_count
+  register: _max_map
+  changed_when: false
+  failed_when: (_max_map.stdout | int) < 262144
+
+- name: "Wazuh | Docker et compose sont disponibles"
+  ansible.builtin.command: docker compose version
+  register: _compose_ok
+  changed_when: false
+
+# -----------------------------------------------------------------------------
+# 2. Récupération du dépôt wazuh-docker
+# -----------------------------------------------------------------------------
+- name: "Wazuh | Installation de git"
+  ansible.builtin.apt:
+    name: git
+    state: present
+
+- name: "Wazuh | Création de l'arborescence"
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: "{{ admin_group }}"
+    mode: "0750"
+  loop:
+    - "{{ wazuh_base_dir }}"
+    - "{{ wazuh_backup_dir }}"
+
+- name: "Wazuh | Clone du dépôt wazuh-docker sur la version {{ wazuh_version }}"
+  ansible.builtin.git:
+    repo: "{{ wazuh_repo_url }}"
+    dest: "{{ wazuh_repo_dir }}"
+    version: "v{{ wazuh_version }}"
+    depth: 1
+    force: false
+  register: _wazuh_clone
+
+- name: "Wazuh | Le dossier de la stack existe bien"
+  ansible.builtin.stat:
+    path: "{{ wazuh_stack_dir }}/docker-compose.yml"
+  register: _stack_file
+
+- name: "Wazuh | Contrôle du clone"
+  ansible.builtin.assert:
+    that:
+      - _stack_file.stat.exists
+    fail_msg: >-
+      {{ wazuh_stack_dir }}/docker-compose.yml est introuvable.
+      Vérifie que la version v{{ wazuh_version }} existe bien dans le dépôt.
+
+# -----------------------------------------------------------------------------
+# 3. Remplacement des mots de passe par défaut
+# -----------------------------------------------------------------------------
+# On agit à deux endroits :
+#   - docker-compose.yml : les mots de passe en clair passés aux conteneurs
+#   - config/wazuh_indexer/internal_users.yml : les hash bcrypt de l'indexer
+# Les deux doivent concorder, sinon l'indexer refuse les connexions.
+# -----------------------------------------------------------------------------
+
+- name: "Wazuh | Sauvegarde du docker-compose.yml d'origine"
+  ansible.builtin.copy:
+    src: "{{ wazuh_stack_dir }}/docker-compose.yml"
+    dest: "{{ wazuh_stack_dir }}/docker-compose.yml.orig"
+    remote_src: true
+    force: false
+    mode: "0640"
+
+- name: "Wazuh | Génération des hash bcrypt des mots de passe"
+  # L'outil hash.sh est fourni dans l'image de l'indexer. On le lance dans un
+  # conteneur jetable plutôt que d'installer bcrypt sur la machine.
+  ansible.builtin.command:
+    cmd: >-
+      docker run --rm wazuh/wazuh-indexer:{{ wazuh_version }}
+      bash /usr/share/wazuh-indexer/plugins/opensearch-security/tools/hash.sh
+      -p {{ item.password | quote }}
+  register: _hashes
+  changed_when: false
+  no_log: true          # ne jamais afficher les mots de passe dans la sortie
+  loop:
+    - { user: "admin", password: "{{ wazuh_admin_password }}" }
+    - { user: "kibanaserver", password: "{{ wazuh_kibanaserver_password }}" }
+  loop_control:
+    label: "{{ item.user }}"
+
+- name: "Wazuh | Assemblage des hash générés"
+  ansible.builtin.set_fact:
+    _wazuh_hashes: >-
+      {{ dict(_hashes.results | map(attribute='item.user')
+              | zip(_hashes.results | map(attribute='stdout_lines') | map('last') | map('trim'))) }}
+  no_log: true
+
+- name: "Wazuh | Injection des hash dans internal_users.yml"
+  ansible.builtin.replace:
+    path: "{{ wazuh_stack_dir }}/config/wazuh_indexer/internal_users.yml"
+    # On remplace la valeur de hash qui suit la déclaration de l'utilisateur.
+    regexp: '(^{{ item.key }}:\n(?:.*\n)*?\s*hash:\s*")[^"]*(")'
+    replace: '\g<1>{{ item.value }}\g<2>'
+  loop: "{{ _wazuh_hashes | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  no_log: true
+
+# Docker Compose interprète le caractère « $ » comme une variable. Un mot de
+# passe contenant un $ doit donc être écrit « $$ » dans le fichier compose,
+# sinon compose tente de résoudre une variable inexistante et le mot de passe
+# arrive tronqué dans le conteneur. C'est une panne pénible à diagnostiquer :
+# la stack démarre, mais l'authentification échoue sans message clair.
+- name: "Wazuh | Échappement des $ pour Docker Compose"
+  ansible.builtin.set_fact:
+    _pwd_admin_compose: "{{ wazuh_admin_password | replace('$', '$$') }}"
+    _pwd_kibana_compose: "{{ wazuh_kibanaserver_password | replace('$', '$$') }}"
+    _pwd_api_compose: "{{ wazuh_api_password | replace('$', '$$') }}"
+  no_log: true
+
+- name: "Wazuh | Remplacement des mots de passe dans docker-compose.yml"
+  ansible.builtin.replace:
+    path: "{{ wazuh_stack_dir }}/docker-compose.yml"
+    regexp: "{{ item.regexp }}"
+    replace: "{{ item.replace }}"
+  loop:
+    # Mot de passe de l'indexer, utilisé par le serveur et le dashboard
+    - regexp: '(INDEXER_PASSWORD=)SecretPassword'
+      replace: '\g<1>{{ _pwd_admin_compose }}'
+    - regexp: '(DASHBOARD_PASSWORD=)kibanaserver'
+      replace: '\g<1>{{ _pwd_kibana_compose }}'
+    - regexp: '(OPENSEARCH_PASSWORD=)SecretPassword'
+      replace: '\g<1>{{ _pwd_admin_compose }}'
+    # API du serveur Wazuh
+    - regexp: '(API_PASSWORD=)MyS3cr37P450r\.\*-'
+      replace: '\g<1>{{ _pwd_api_compose }}'
+    - regexp: '(WAZUH_API_PASSWORD=)MyS3cr37P450r\.\*-'
+      replace: '\g<1>{{ _pwd_api_compose }}'
+  loop_control:
+    label: "{{ item.regexp | regex_replace('=.*', '') }}"
+  no_log: true
+
+- name: "Wazuh | Contrôle : plus aucun mot de passe par défaut ne subsiste"
+  ansible.builtin.shell:
+    cmd: >-
+      grep -aE 'SecretPassword|MyS3cr37P450r|=kibanaserver'
+      {{ wazuh_stack_dir }}/docker-compose.yml || true
+  register: _defauts
+  changed_when: false
+
+- name: "Wazuh | Échec si un mot de passe par défaut est resté"
+  ansible.builtin.assert:
+    that:
+      - _defauts.stdout | length == 0
+    fail_msg: >-
+      Des mots de passe par défaut subsistent dans docker-compose.yml.
+      Le format du fichier a probablement changé dans la version
+      {{ wazuh_version }} : vérifie les expressions de remplacement du rôle.
+
+- name: "Wazuh | Restriction des droits sur les fichiers de configuration"
+  ansible.builtin.file:
+    path: "{{ item }}"
+    owner: root
+    group: root
+    mode: "0600"
+  loop:
+    - "{{ wazuh_stack_dir }}/docker-compose.yml"
+    - "{{ wazuh_stack_dir }}/config/wazuh_indexer/internal_users.yml"
+
+# -----------------------------------------------------------------------------
+# 4. Certificats internes
+# -----------------------------------------------------------------------------
+- name: "Wazuh | Les certificats ont-ils déjà été générés ?"
+  ansible.builtin.stat:
+    path: "{{ wazuh_stack_dir }}/config/wazuh_indexer_ssl_certs/root-ca.pem"
+  register: _certs
+
+- name: "Wazuh | Génération des certificats internes de la stack"
+  ansible.builtin.command:
+    cmd: docker compose -f generate-indexer-certs.yml run --rm generator
+    chdir: "{{ wazuh_stack_dir }}"
+  register: _certgen
+  changed_when: true
+  when: not _certs.stat.exists
+
+- name: "Wazuh | Contrôle que les certificats existent"
+  ansible.builtin.stat:
+    path: "{{ wazuh_stack_dir }}/config/wazuh_indexer_ssl_certs/root-ca.pem"
+  register: _certs_apres
+  failed_when: not _certs_apres.stat.exists
+
+# -----------------------------------------------------------------------------
+# 5. Démarrage de la stack
+# -----------------------------------------------------------------------------
+- name: "Wazuh | Téléchargement des images (~2 Go, peut prendre un moment)"
+  ansible.builtin.command:
+    cmd: docker compose pull
+    chdir: "{{ wazuh_stack_dir }}"
+  register: _pull
+  changed_when: "'Downloaded' in _pull.stderr or 'Pulled' in _pull.stderr"
+  async: "{{ wazuh_pull_timeout }}"
+  poll: 15
+  when: wazuh_start_stack | bool
+
+- name: "Wazuh | Démarrage de la stack"
+  ansible.builtin.command:
+    cmd: docker compose up -d
+    chdir: "{{ wazuh_stack_dir }}"
+  register: _up
+  changed_when: true
+  when: wazuh_start_stack | bool
+
+- name: "Wazuh | Service systemd pour redémarrer la stack au boot"
+  ansible.builtin.template:
+    src: wazuh-stack.service.j2
+    dest: /etc/systemd/system/wazuh-stack.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: reload systemd
+
+- name: "Wazuh | Activation du service au démarrage"
+  ansible.builtin.systemd:
+    name: wazuh-stack
+    enabled: true
+    daemon_reload: true
+
+# -----------------------------------------------------------------------------
+# 6. Attente et vérifications
+# -----------------------------------------------------------------------------
+- name: "Wazuh | Attente du dashboard (jusqu'à {{ wazuh_dashboard_timeout }} s)"
+  ansible.builtin.uri:
+    url: "https://{{ ansible_host | default(ansible_default_ipv4.address) }}:{{ wazuh_dashboard_port }}/app/login"
+    validate_certs: false
+    status_code: [200, 302]
+    timeout: 20
+  register: _dash
+  until: _dash.status in [200, 302]
+  retries: "{{ (wazuh_dashboard_timeout | int / 20) | round | int }}"
+  delay: 20
+  when:
+    - wazuh_start_stack | bool
+    - wazuh_wait_for_dashboard | bool
+
+- name: "Wazuh | État des conteneurs"
+  ansible.builtin.command:
+    cmd: docker compose ps --format "table {{ '{{' }}.Name{{ '}}' }}\t{{ '{{' }}.State{{ '}}' }}\t{{ '{{' }}.Status{{ '}}' }}"
+    chdir: "{{ wazuh_stack_dir }}"
+  register: _ps
+  changed_when: false
+  when: wazuh_start_stack | bool
+
+- name: "Wazuh | Contrôle que les 3 conteneurs tournent"
+  ansible.builtin.shell:
+    cmd: docker compose ps --status running --quiet | wc -l
+    chdir: "{{ wazuh_stack_dir }}"
+  register: _running
+  changed_when: false
+  failed_when: (_running.stdout | int) < 3
+  when: wazuh_start_stack | bool
+
+# -----------------------------------------------------------------------------
+# Sauvegarde automatique
+# -----------------------------------------------------------------------------
+- name: "Wazuh | Sauvegarde automatique de la configuration"
+  when: wazuh_backup_enabled | bool
+  block:
+
+    - name: "Wazuh | Script de sauvegarde"
+      ansible.builtin.template:
+        src: wazuh-backup.sh.j2
+        dest: /usr/local/bin/wazuh-backup.sh
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: "Wazuh | Service de sauvegarde"
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/wazuh-backup.service
+        content: |
+          # Géré par Ansible
+          [Unit]
+          Description=Sauvegarde de la configuration Wazuh
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/bin/wazuh-backup.sh
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: "Wazuh | Minuterie de sauvegarde ({{ wazuh_backup_schedule }})"
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/wazuh-backup.timer
+        content: |
+          # Géré par Ansible
+          [Unit]
+          Description=Declenche la sauvegarde Wazuh
+
+          [Timer]
+          OnCalendar={{ wazuh_backup_schedule }}
+          Persistent=true
+          RandomizedDelaySec=30m
+
+          [Install]
+          WantedBy=timers.target
+        owner: root
+        group: root
+        mode: "0644"
+      notify: reload systemd
+
+    - name: "Wazuh | Activation de la minuterie de sauvegarde"
+      ansible.builtin.systemd:
+        name: wazuh-backup.timer
+        enabled: true
+        state: started
+        daemon_reload: true
+
+# -----------------------------------------------------------------------------
+# Récapitulatif
+# -----------------------------------------------------------------------------
+- name: "Wazuh | Déploiement terminé"
+  ansible.builtin.debug:
+    msg:
+      - "==================================================================="
+      - "  WAZUH {{ wazuh_version }} OPÉRATIONNEL"
+      - "==================================================================="
+      - "  Interface web :"
+      - "    https://{{ ansible_host | default(ansible_default_ipv4.address) }}"
+      - "    Identifiant : admin"
+      - "    Mot de passe : celui du vault (vault_wazuh_admin_password)"
+      - ""
+      - "  Le certificat est auto-signé : le navigateur affichera un"
+      - "  avertissement au premier accès, c'est normal."
+      - ""
+      - "  API Wazuh    : https://{{ ansible_host | default(ansible_default_ipv4.address) }}:{{ wazuh_api_port }}"
+      - "  Port agents  : {{ wazuh_agent_port }}/tcp"
+      - "  Enrôlement   : {{ wazuh_enrollment_port }}/tcp"
+      - "  Syslog       : {{ wazuh_syslog_port }}/udp"
+      - ""
+      - "  Stack        : {{ wazuh_stack_dir }}"
+      - "  Sauvegardes  : {{ wazuh_backup_dir }}"
+      - "==================================================================="
+
+- name: "Wazuh | État détaillé des conteneurs"
+  ansible.builtin.debug:
+    var: _ps.stdout_lines
+  when:
+    - wazuh_start_stack | bool
+    - _ps.stdout_lines is defined

@@ -1,0 +1,70 @@
+#!/bin/bash
+# =====================================================================
+# Sauvegarde de la configuration Wazuh
+# Généré par Ansible pour {{ inventory_hostname }} — ne pas éditer
+# ---------------------------------------------------------------------
+# Ce script sauvegarde la CONFIGURATION et les règles, pas les données
+# de l'indexer. Les journaux collectés représentent des dizaines de Go
+# et se sauvegardent avec les snapshots OpenSearch, pas avec un tar.
+#
+# Ce qui est sauvegardé :
+#   - docker-compose.yml et les fichiers config/ (dont les certificats)
+#   - les règles et décodeurs personnalisés du serveur Wazuh
+#   - la liste des agents enrôlés
+# =====================================================================
+
+set -euo pipefail
+
+STACK_DIR="{{ wazuh_stack_dir }}"
+BACKUP_DIR="{{ wazuh_backup_dir }}"
+RETENTION={{ wazuh_backup_retention_days }}
+HORODATAGE=$(date +%Y%m%d-%H%M%S)
+ARCHIVE="${BACKUP_DIR}/wazuh-conf-${HORODATAGE}.tar.gz"
+
+mkdir -p "${BACKUP_DIR}"
+
+echo "[$(date '+%F %T')] Debut de la sauvegarde Wazuh"
+
+# --- Configuration de la stack ---------------------------------------
+TMP=$(mktemp -d)
+trap 'rm -rf "${TMP}"' EXIT
+
+cp -a "${STACK_DIR}/docker-compose.yml" "${TMP}/" 2>/dev/null || true
+cp -a "${STACK_DIR}/config"             "${TMP}/" 2>/dev/null || true
+
+# --- Règles et décodeurs personnalisés du serveur --------------------
+if docker ps --format '{{ '{{' }}.Names{{ '}}' }}' | grep -q wazuh.manager; then
+    CONTENEUR=$(docker ps --format '{{ '{{' }}.Names{{ '}}' }}' | grep wazuh.manager | head -1)
+
+    mkdir -p "${TMP}/manager"
+
+    # ossec.conf : la configuration principale du serveur
+    docker cp "${CONTENEUR}:/var/ossec/etc/ossec.conf" \
+        "${TMP}/manager/ossec.conf" 2>/dev/null || true
+
+    # Règles et décodeurs écrits par vous
+    docker cp "${CONTENEUR}:/var/ossec/etc/rules" \
+        "${TMP}/manager/rules" 2>/dev/null || true
+    docker cp "${CONTENEUR}:/var/ossec/etc/decoders" \
+        "${TMP}/manager/decoders" 2>/dev/null || true
+
+    # Liste des agents enrôlés : permet de savoir ce qu'il faut ré-enrôler
+    docker exec "${CONTENEUR}" /var/ossec/bin/agent_control -l \
+        > "${TMP}/manager/agents.txt" 2>/dev/null || true
+else
+    echo "[$(date '+%F %T')] ATTENTION : conteneur wazuh.manager introuvable"
+fi
+
+# --- Archive ---------------------------------------------------------
+tar czf "${ARCHIVE}" -C "${TMP}" .
+chmod 600 "${ARCHIVE}"
+
+TAILLE=$(du -h "${ARCHIVE}" | cut -f1)
+echo "[$(date '+%F %T')] Archive creee : ${ARCHIVE} (${TAILLE})"
+
+# --- Rotation --------------------------------------------------------
+SUPPRIMEES=$(find "${BACKUP_DIR}" -name 'wazuh-conf-*.tar.gz' \
+    -mtime "+${RETENTION}" -print -delete | wc -l)
+echo "[$(date '+%F %T')] ${SUPPRIMEES} archive(s) de plus de ${RETENTION} jours supprimee(s)"
+
+echo "[$(date '+%F %T')] Sauvegarde terminee"

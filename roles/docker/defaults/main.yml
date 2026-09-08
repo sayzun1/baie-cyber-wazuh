@@ -1,0 +1,54 @@
+---
+# =============================================================================
+# Rôle docker — installation depuis le dépôt officiel Docker
+# -----------------------------------------------------------------------------
+# On n'utilise PAS le paquet docker.io de Debian : il est souvent en retard
+# de plusieurs versions majeures et ne fournit pas le plugin
+# « docker compose » v2, dont Wazuh a besoin.
+# =============================================================================
+
+docker_apt_url: "https://download.docker.com/linux/debian"
+docker_apt_key_url: "https://download.docker.com/linux/debian/gpg"
+docker_apt_keyring: "/etc/apt/keyrings/docker.asc"
+
+# Paquets de la stack Docker complète
+docker_packages:
+  - docker-ce
+  - docker-ce-cli
+  - containerd.io
+  - docker-buildx-plugin
+  - docker-compose-plugin
+
+# Utilisateurs ajoutés au groupe docker.
+# Par défaut : les 3 administrateurs du projet + le compte de service.
+docker_users: "{{ (admins | map(attribute='name') | list) + [ansible_user] }}"
+
+# --- Configuration du démon -------------------------------------------------
+# Rotation des logs : sans elle, un conteneur bavard remplit /var/lib/docker
+# jusqu'à saturer le disque. C'est la panne n°1 des installations Docker
+# laissées par défaut.
+docker_log_max_size: "50m"
+docker_log_max_file: 5
+docker_storage_driver: "overlay2"
+docker_live_restore: true      # les conteneurs survivent au redémarrage du démon
+docker_userland_proxy: false
+docker_no_new_privileges: true # un conteneur ne peut pas élever ses privilèges
+
+# --- Réseau Docker ----------------------------------------------------------
+# Plage utilisée par les réseaux bridge créés par Docker.
+# À adapter si elle entre en conflit avec ton plan d'adressage.
+docker_default_address_pool_base: "172.20.0.0/16"
+docker_default_address_pool_size: 24
+
+# --- Prérequis Wazuh --------------------------------------------------------
+# L'indexer Wazuh (basé sur OpenSearch) crée énormément de zones mémoire
+# virtuelles. La limite Linux par défaut (65530) le fait planter au démarrage
+# avec une erreur « max virtual memory areas vm.max_map_count [65530] is too low ».
+docker_sysctl_tuning: true
+docker_vm_max_map_count: 262144
+docker_nofile_limit: 65536
+
+# --- Maintenance ------------------------------------------------------------
+# Nettoyage hebdomadaire des images et volumes orphelins.
+docker_prune_enabled: true
+docker_prune_schedule: "weekly"

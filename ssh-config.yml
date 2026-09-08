@@ -1,0 +1,37 @@
+---
+# =============================================================================
+# PLAYBOOK — Application (ou réapplication) de la configuration SSH
+# -----------------------------------------------------------------------------
+# À lancer sans créer de VM, par exemple quand :
+#   - un collègue change de clé
+#   - un quatrième administrateur rejoint le projet
+#   - vous durcissez la politique et voulez la propager partout
+#
+# Sur toutes les VM :
+#   ansible-playbook ssh-config.yml
+#
+# Sur un seul serveur :
+#   ansible-playbook ssh-config.yml --limit srv-web01
+#
+# Sur une zone :
+#   ansible-playbook ssh-config.yml --limit dmz
+#
+# Vérifier ce qui changerait sans rien modifier :
+#   ansible-playbook ssh-config.yml --check --diff
+# =============================================================================
+
+- name: "Configuration SSH de l'ensemble du parc"
+  hosts: "{{ cible | default('vms') }}"
+  gather_facts: true
+  become: true
+  serial: "{{ lot | default('100%') }}"   # -e "lot=1" pour y aller machine par machine
+
+  pre_tasks:
+    - name: "Rappel des comptes qui seront déployés"
+      ansible.builtin.debug:
+        msg: "Administrateurs : {{ admins | map(attribute='name') | join(', ') }}"
+      run_once: true
+
+  roles:
+    - role: ssh_hardening
+      tags: [ssh]

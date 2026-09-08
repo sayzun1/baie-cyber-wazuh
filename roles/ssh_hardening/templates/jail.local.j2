@@ -1,0 +1,32 @@
+# =====================================================================
+# fail2ban — généré par Ansible pour {{ inventory_hostname }}
+# =====================================================================
+
+[DEFAULT]
+# Réseaux jamais bannis : sans ça, une erreur de manipulation depuis
+# votre poste d'administration vous coupe l'accès à la machine.
+ignoreip = 127.0.0.1/8 ::1 {{ ssh_allowed_networks | join(' ') }}
+
+bantime  = {{ fail2ban_bantime }}
+findtime = {{ fail2ban_findtime }}
+maxretry = {{ fail2ban_maxretry }}
+backend  = systemd
+banaction = nftables-multiport
+
+[sshd]
+enabled  = true
+port     = {{ ssh_port }}
+filter   = sshd
+maxretry = {{ fail2ban_maxretry }}
+bantime  = {{ fail2ban_bantime }}
+
+# Prison agressive : bannissement long pour les scans automatisés qui
+# tentent de se connecter en root ou sur des comptes inexistants.
+[sshd-agressif]
+enabled   = true
+port      = {{ ssh_port }}
+filter    = sshd
+mode      = aggressive
+maxretry  = 2
+findtime  = 300
+bantime   = 86400

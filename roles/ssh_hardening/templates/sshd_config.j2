@@ -1,0 +1,98 @@
+#####################################################################
+# sshd_config — généré par Ansible pour {{ inventory_hostname }}
+# Projet : {{ projet_nom }}
+#
+# NE PAS ÉDITER À LA MAIN : toute modification sera écrasée au
+# prochain passage du playbook. Modifiez plutôt les variables dans
+# inventory/group_vars/all.yml.
+#####################################################################
+
+# --- Écoute ---------------------------------------------------------
+Port {{ ssh_port }}
+AddressFamily inet
+ListenAddress 0.0.0.0
+Protocol 2
+
+# --- Clés d'hôte (ED25519 en priorité) ------------------------------
+HostKey /etc/ssh/ssh_host_ed25519_key
+HostKey /etc/ssh/ssh_host_rsa_key
+
+# --- Algorithmes cryptographiques -----------------------------------
+# Sélection restreinte aux algorithmes recommandés (ANSSI / Mozilla
+# "modern"). Tout ce qui est plus faible est explicitement absent.
+KexAlgorithms {{ ssh_kex_algorithms | join(',') }}
+Ciphers {{ ssh_ciphers | join(',') }}
+MACs {{ ssh_macs | join(',') }}
+HostKeyAlgorithms {{ ssh_host_key_algorithms | join(',') }}
+PubkeyAcceptedAlgorithms {{ ssh_host_key_algorithms | join(',') }}
+
+# --- Authentification -----------------------------------------------
+# Root ne se connecte jamais directement : traçabilité des actions.
+PermitRootLogin {{ ssh_permit_root_login }}
+
+# Clés publiques uniquement.
+PubkeyAuthentication {{ 'yes' if ssh_pubkey_authentication else 'no' }}
+AuthorizedKeysFile .ssh/authorized_keys
+
+# Mots de passe totalement désactivés (les 3 méthodes doivent être à no,
+# sinon une seule oubliée suffit à rouvrir la porte).
+PasswordAuthentication {{ 'yes' if ssh_password_authentication else 'no' }}
+PermitEmptyPasswords no
+ChallengeResponseAuthentication no
+KbdInteractiveAuthentication no
+
+# Méthodes anciennes, désactivées.
+HostbasedAuthentication no
+IgnoreRhosts yes
+GSSAPIAuthentication no
+KerberosAuthentication no
+UsePAM yes
+
+# --- Limitation des tentatives --------------------------------------
+MaxAuthTries {{ ssh_max_auth_tries }}
+MaxSessions 5
+MaxStartups 10:30:60
+LoginGraceTime {{ ssh_login_grace_time }}
+
+# --- Contrôle d'accès ------------------------------------------------
+# Seuls les membres du groupe {{ admin_group }} peuvent ouvrir une session.
+# Un compte créé hors de ce groupe n'aura pas d'accès SSH, même avec une clé.
+AllowGroups {{ ssh_allow_groups }}
+DenyUsers root daemon bin sys sync games man lp mail news uucp proxy www-data backup list irc nobody
+
+# --- Sessions ---------------------------------------------------------
+# Déconnexion automatique après {{ (ssh_client_alive_interval | int * ssh_client_alive_count_max | int) }} s d'inactivité.
+ClientAliveInterval {{ ssh_client_alive_interval }}
+ClientAliveCountMax {{ ssh_client_alive_count_max }}
+TCPKeepAlive no
+
+# --- Fonctionnalités désactivées (réduction de surface d'attaque) ----
+X11Forwarding {{ 'yes' if ssh_x11_forwarding else 'no' }}
+AllowAgentForwarding no
+AllowTcpForwarding no
+GatewayPorts no
+PermitTunnel no
+PermitUserEnvironment no
+PrintLastLog yes
+Compression no
+
+# --- Journalisation ---------------------------------------------------
+# VERBOSE journalise l'empreinte de la clé utilisée : indispensable pour
+# savoir LEQUEL des trois administrateurs s'est connecté.
+SyslogFacility AUTH
+LogLevel VERBOSE
+
+{% if ssh_banner_enabled %}
+# --- Bannière légale --------------------------------------------------
+Banner /etc/ssh/banner
+{% endif %}
+PrintMotd no
+DebianBanner no
+
+# --- Transfert de fichiers -------------------------------------------
+Subsystem sftp /usr/lib/openssh/sftp-server -f AUTHPRIV -l INFO
+
+# --- Divers ------------------------------------------------------------
+StrictModes yes
+UseDNS no
+AcceptEnv LANG LC_*

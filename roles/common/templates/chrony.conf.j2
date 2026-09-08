@@ -1,0 +1,13 @@
+# chrony — généré par Ansible pour {{ inventory_hostname }}
+# Une horloge juste est indispensable : sans elle, les journaux de
+# plusieurs machines deviennent incomparables lors d'une analyse
+# d'incident, et l'authentification par certificat casse.
+
+{% for serveur in ntp_servers %}
+pool {{ serveur }} iburst
+{% endfor %}
+
+driftfile /var/lib/chrony/chrony.drift
+makestep 1.0 3
+rtcsync
+logdir /var/log/chrony

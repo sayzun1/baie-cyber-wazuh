@@ -1,0 +1,28 @@
+---
+# =============================================================================
+# Rôle vm_preseed — installation Debian automatisée (sans template)
+# =============================================================================
+
+vm_id: ""
+vm_id_min: 100
+vm_id_max: 999
+
+# ISO d'installation présente dans le stockage ISO du Proxmox
+preseed_iso: "debian-12.5.0-amd64-netinst.iso"
+preseed_iso_volume: "{{ pve_iso_storage }}:iso/{{ preseed_iso }}"
+
+# Le fichier preseed généré est servi par un petit serveur HTTP lancé
+# temporairement sur la machine Ansible pendant l'installation.
+preseed_http_port: 8099
+preseed_workdir: "/tmp/ansible-preseed"
+
+# Paramètres d'installation
+preseed_mirror_host: "deb.debian.org"
+preseed_mirror_dir: "/debian"
+preseed_keymap: "fr(oss)"
+preseed_locale: "fr_FR.UTF-8"
+preseed_timezone: "Europe/Paris"
+preseed_partitioning: "atomic"     # atomic = tout dans une partition ; home / multi possibles
+
+# Délai maximum accordé à l'installation complète (secondes)
+preseed_install_timeout: 1800

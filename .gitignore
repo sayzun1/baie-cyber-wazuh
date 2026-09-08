@@ -1,0 +1,38 @@
+# =============================================================================
+# Ne jamais versionner de secret
+# =============================================================================
+
+# Mot de passe du vault
+.vault_pass
+*.vault_pass
+
+# Vault en clair (avant chiffrement) — le .example, lui, est versionné
+inventory/group_vars/vault.yml
+!inventory/group_vars/vault.yml.example
+
+# Clés PRIVÉES — les .pub sont versionnés volontairement
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+!*.pub
+
+# Journaux et fichiers temporaires
+*.log
+ansible.log
+*.retry
+/tmp/
+.preseed/
+
+# Éditeurs
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+.DS_Store
+
+# Environnements Python
+venv/
+.venv/
+__pycache__/

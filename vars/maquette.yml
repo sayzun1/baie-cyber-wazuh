@@ -1,0 +1,56 @@
+---
+# =============================================================================
+# Description de la maquette complète de la baie cyber.
+# Utilisé par deploy-multi.yml pour tout monter en une commande.
+# Ajustez les IP, bridges et VLAN à votre plan d'adressage réel.
+# =============================================================================
+
+maquette:
+
+  # --- Zone LAN (vmbr1, VLAN 10) --------------------------------------------
+  - vm_name: "srv-dns01"
+    vm_ip: "192.168.10.11/24"
+    vm_gateway: "192.168.10.254"
+    vm_bridge: "vmbr1"
+    vm_vlan: "10"
+    vm_cores: 2
+    vm_memory: 2048
+    vm_disk: 20
+
+  - vm_name: "srv-web01"
+    vm_ip: "192.168.10.20/24"
+    vm_gateway: "192.168.10.254"
+    vm_bridge: "vmbr1"
+    vm_vlan: "10"
+    vm_cores: 2
+    vm_memory: 4096
+    vm_disk: 40
+
+  # --- Zone DMZ (vmbr2, VLAN 20) --------------------------------------------
+  - vm_name: "srv-proxy01"
+    vm_ip: "172.16.0.10/24"
+    vm_gateway: "172.16.0.254"
+    vm_bridge: "vmbr2"
+    vm_vlan: "20"
+    vm_cores: 2
+    vm_memory: 2048
+    vm_disk: 20
+
+  # --- Zone administration / supervision (vmbr3, VLAN 30) -------------------
+  - vm_name: "srv-siem01"
+    vm_ip: "10.0.0.30/24"
+    vm_gateway: "10.0.0.254"
+    vm_bridge: "vmbr3"
+    vm_vlan: "30"
+    vm_cores: 4
+    vm_memory: 8192
+    vm_disk: 100
+
+  - vm_name: "srv-backup01"
+    vm_ip: "10.0.0.40/24"
+    vm_gateway: "10.0.0.254"
+    vm_bridge: "vmbr3"
+    vm_vlan: "30"
+    vm_cores: 2
+    vm_memory: 4096
+    vm_disk: 200

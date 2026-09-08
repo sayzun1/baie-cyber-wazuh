@@ -1,0 +1,33 @@
+# =============================================================================
+# Normalisation des fins de ligne
+# -----------------------------------------------------------------------------
+# Le projet s'édite sous Windows (CRLF) mais s'exécute sous Linux (LF).
+# Sans ce fichier, un playbook édité sous Windows peut arriver sur la VM
+# avec des retours chariot qui cassent les templates rendus par Ansible —
+# typiquement un sshd_config ou un nftables.conf que le service refuse de
+# charger, avec un message d'erreur incompréhensible.
+#
+# On force donc le LF pour tout ce qui finit sur une machine Linux.
+# =============================================================================
+
+# Par défaut : Git détecte le texte et normalise en LF dans le dépôt
+* text=auto eol=lf
+
+# Fichiers qui DOIVENT être en LF, sans exception
+*.yml     text eol=lf
+*.yaml    text eol=lf
+*.j2      text eol=lf
+*.cfg     text eol=lf
+*.sh      text eol=lf
+*.pub     text eol=lf
+*.md      text eol=lf
+.gitignore     text eol=lf
+.vault_pass    text eol=lf
+
+# Binaires : ne jamais toucher
+*.qcow2   binary
+*.iso     binary
+*.png     binary
+*.jpg     binary
+*.pdf     binary
+*.tar.gz  binary

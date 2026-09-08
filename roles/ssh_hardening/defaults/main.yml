@@ -1,0 +1,41 @@
+---
+# Valeurs de repli du rôle ssh_hardening.
+# En pratique tout est défini dans inventory/group_vars/all.yml ;
+# ces défauts évitent que le rôle casse s'il est réutilisé ailleurs.
+
+admin_group: "adminsys"
+admins: []
+
+ssh_port: 22
+ssh_permit_root_login: "no"
+ssh_password_authentication: false
+ssh_pubkey_authentication: true
+ssh_max_auth_tries: 3
+ssh_login_grace_time: 30
+ssh_client_alive_interval: 300
+ssh_client_alive_count_max: 2
+ssh_x11_forwarding: false
+ssh_allow_groups: "{{ admin_group }}"
+ssh_banner_enabled: true
+ssh_allowed_networks: []
+
+ssh_kex_algorithms:
+  - "curve25519-sha256"
+  - "curve25519-sha256@libssh.org"
+ssh_ciphers:
+  - "chacha20-poly1305@openssh.com"
+  - "aes256-gcm@openssh.com"
+ssh_macs:
+  - "hmac-sha2-512-etm@openssh.com"
+  - "hmac-sha2-256-etm@openssh.com"
+ssh_host_key_algorithms:
+  - "ssh-ed25519"
+  - "rsa-sha2-512"
+
+fail2ban_enabled: true
+fail2ban_maxretry: 4
+fail2ban_bantime: 3600
+fail2ban_findtime: 600
+
+firewall_enabled: true
+projet_nom: "Baie reseau cyber"

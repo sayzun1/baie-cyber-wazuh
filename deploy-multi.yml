@@ -1,0 +1,74 @@
+---
+# =============================================================================
+# PLAYBOOK — Déploiement de plusieurs VM en une seule commande
+# -----------------------------------------------------------------------------
+# Pratique pour monter toute la maquette de la baie d'un coup, en démo.
+#
+#   ansible-playbook deploy-multi.yml
+#
+# La liste des machines se modifie dans vars/maquette.yml.
+# =============================================================================
+
+- name: "Déploiement complet de la maquette"
+  hosts: proxmox
+  gather_facts: true
+  connection: local
+
+  vars_files:
+    - vars/maquette.yml
+
+  tasks:
+
+    - name: "Récapitulatif de la maquette"
+      ansible.builtin.debug:
+        msg: "{{ maquette | length }} machines à déployer : {{ maquette | map(attribute='vm_name') | join(', ') }}"
+
+    - name: "Création des VM une par une"
+      ansible.builtin.include_role:
+        name: vm_provision
+      vars:
+        vm_name: "{{ machine.vm_name }}"
+        vm_ip: "{{ machine.vm_ip }}"
+        vm_gateway: "{{ machine.vm_gateway }}"
+        vm_bridge: "{{ machine.vm_bridge }}"
+        vm_vlan: "{{ machine.vm_vlan | default('') }}"
+        vm_cores: "{{ machine.vm_cores | default(2) }}"
+        vm_memory: "{{ machine.vm_memory | default(2048) }}"
+        vm_disk: "{{ machine.vm_disk | default(20) }}"
+        vm_id: "{{ machine.vm_id | default('') }}"
+      loop: "{{ maquette }}"
+      loop_control:
+        loop_var: machine
+        label: "{{ machine.vm_name }} ({{ machine.vm_ip }})"
+
+    - name: "Ajout des nouvelles machines à l'inventaire en mémoire"
+      ansible.builtin.add_host:
+        name: "{{ machine.vm_name }}"
+        groups: [vms, nouvellement_creees]
+        ansible_host: "{{ machine.vm_ip | ansible.utils.ipaddr('address') }}"
+      loop: "{{ maquette }}"
+      loop_control:
+        loop_var: machine
+        label: "{{ machine.vm_name }}"
+      changed_when: false
+
+    - name: "Attente que toutes les machines répondent en SSH"
+      ansible.builtin.wait_for:
+        host: "{{ machine.vm_ip | ansible.utils.ipaddr('address') }}"
+        port: 22
+        delay: 10
+        timeout: "{{ vm_ssh_wait_timeout }}"
+      loop: "{{ maquette }}"
+      loop_control:
+        loop_var: machine
+        label: "{{ machine.vm_name }}"
+
+
+- name: "Configuration de toutes les nouvelles machines"
+  hosts: nouvellement_creees
+  gather_facts: true
+  become: true
+
+  roles:
+    - common
+    - ssh_hardening
